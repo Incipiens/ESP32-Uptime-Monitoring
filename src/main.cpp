@@ -319,6 +319,12 @@ void initWebServer() {
   // import services configuration
   server.on("/api/import", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      // Limit payload size to 16KB to prevent DoS
+      if (total > 16384) {
+        request->send(400, "application/json", "{\"error\":\"Payload too large\"}");
+        return;
+      }
+
       JsonDocument doc;
       DeserializationError error = deserializeJson(doc, data, len);
 
@@ -342,6 +348,14 @@ void initWebServer() {
           continue;
         }
 
+        // Validate required fields
+        String name = obj["name"].as<String>();
+        String host = obj["host"].as<String>();
+        if (name.length() == 0 || host.length() == 0) {
+          skippedCount++;
+          continue;
+        }
+
         String typeStr = obj["type"].as<String>();
         ServiceType type;
         if (typeStr == "home_assistant") {
@@ -357,15 +371,22 @@ void initWebServer() {
           continue;
         }
 
+        // Validate and constrain numeric values
+        int port = obj["port"] | 80;
+        if (port < 1 || port > 65535) port = 80;
+
+        int checkInterval = obj["checkInterval"] | 60;
+        if (checkInterval < 10) checkInterval = 10;
+
         Service newService;
         newService.id = generateServiceId();
-        newService.name = obj["name"].as<String>();
+        newService.name = name;
         newService.type = type;
-        newService.host = obj["host"].as<String>();
-        newService.port = obj["port"] | 80;
+        newService.host = host;
+        newService.port = port;
         newService.path = obj["path"] | "/";
         newService.expectedResponse = obj["expectedResponse"] | "*";
-        newService.checkInterval = obj["checkInterval"] | 60;
+        newService.checkInterval = checkInterval;
         newService.isUp = false;
         newService.lastCheck = 0;
         newService.lastUptime = 0;
