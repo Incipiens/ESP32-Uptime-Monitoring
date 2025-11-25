@@ -1,5 +1,6 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <FS.h>
@@ -10,6 +11,19 @@
 // WiFi credentials, need to update these with your network details
 const char* WIFI_SSID = "xxx";
 const char* WIFI_PASSWORD = "xxx";
+
+// ntfy configuration - set NTFY_TOPIC to enable notifications
+const char* NTFY_SERVER = "https://ntfy.sh"; // Change to your self-hosted server if needed
+const char* NTFY_TOPIC = "";                 // Example: "esp32-uptime"
+const char* NTFY_ACCESS_TOKEN = "";           // Optional: bearer token for authenticated servers
+const char* NTFY_USERNAME = "";               // Optional: basic auth username
+const char* NTFY_PASSWORD = "";               // Optional: basic auth password
+
+bool isNtfyConfigured() {
+  return strlen(NTFY_TOPIC) > 0;
+}
+
+void sendNtfyNotification(const String& title, const String& message);
 
 AsyncWebServer server(80);
 
@@ -53,6 +67,7 @@ void loadServices();
 void saveServices();
 String generateServiceId();
 void checkServices();
+void sendOfflineNotification(const Service& service);
 bool checkHomeAssistant(Service& service);
 bool checkJellyfin(Service& service);
 bool checkHttpGet(Service& service);
@@ -295,6 +310,10 @@ void checkServices() {
       Serial.printf("Service '%s' is now %s\n",
         services[i].name.c_str(),
         services[i].isUp ? "UP" : "DOWN");
+
+      if (!services[i].isUp) {
+        sendOfflineNotification(services[i]);
+      }
     }
   }
 }
@@ -382,6 +401,63 @@ bool checkPing(Service& service) {
     service.lastError = "Ping timeout";
   }
   return success;
+}
+
+void sendOfflineNotification(const Service& service) {
+  if (!isNtfyConfigured()) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping ntfy notification: WiFi not connected");
+    return;
+  }
+
+  String title = "Service DOWN: " + service.name;
+  String message = "Service '" + service.name + "' at " + service.host;
+  if (service.port > 0) {
+    message += ":" + String(service.port);
+  }
+  message += " is offline.";
+
+  if (service.lastError.length() > 0) {
+    message += " Error: " + service.lastError;
+  }
+
+  sendNtfyNotification(title, message);
+}
+
+void sendNtfyNotification(const String& title, const String& message) {
+  HTTPClient http;
+  String url = String(NTFY_SERVER) + "/" + NTFY_TOPIC;
+
+  WiFiClientSecure client;
+  bool isSecure = url.startsWith("https://");
+  if (isSecure) {
+    client.setInsecure();
+    http.begin(client, url);
+  } else {
+    http.begin(url);
+  }
+  http.addHeader("Title", title);
+  http.addHeader("Tags", "warning,monitor");
+  http.addHeader("Content-Type", "text/plain");
+
+  if (strlen(NTFY_ACCESS_TOKEN) > 0) {
+    http.addHeader("Authorization", "Bearer " + String(NTFY_ACCESS_TOKEN));
+  } else if (strlen(NTFY_USERNAME) > 0) {
+    http.setAuthorization(NTFY_USERNAME, NTFY_PASSWORD);
+  }
+
+  int httpCode = http.POST(message);
+
+  if (httpCode > 0) {
+    Serial.printf("ntfy notification sent: %d\n", httpCode);
+  } else {
+    Serial.printf("Failed to send ntfy notification: %d\n", httpCode);
+  }
+
+  http.end();
 }
 
 void saveServices() {

@@ -10,6 +10,7 @@ It serves as a framework to monitor services where support can be hardcoded as a
 - **Jellyfin** server monitoring
 - **HTTP GET** requests with expected response validation
 - **Ping** monitoring
+- Optional **ntfy offline notifications** when services go down
 - Web-based UI for adding and managing services
 - Persistent storage using LittleFS
 
@@ -47,6 +48,29 @@ Before deploying, you need to configure your WiFi credentials:
    const char* WIFI_SSID = "YourNetworkName";
    const char* WIFI_PASSWORD = "YourPassword";
    ```
+
+### Enabling ntfy notifications
+
+Set an ntfy topic to receive alerts whenever a monitored service goes offline. Optional bearer or basic authentication is also supported for secured ntfy servers.
+
+1. In `src/main.cpp`, locate the ntfy configuration block:
+   ```cpp
+   const char* NTFY_SERVER = "https://ntfy.sh";
+   const char* NTFY_TOPIC = "";
+   const char* NTFY_ACCESS_TOKEN = "";
+   const char* NTFY_USERNAME = "";
+   const char* NTFY_PASSWORD = "";
+   ```
+2. Replace `NTFY_TOPIC` with your topic name (for self-hosted ntfy, update `NTFY_SERVER` as well). Provide authentication if required by your server:
+   ```cpp
+   const char* NTFY_SERVER = "https://ntfy.sh";
+   const char* NTFY_TOPIC = "esp32-uptime";
+   // use either a bearer token or basic auth credentials
+   const char* NTFY_ACCESS_TOKEN = "my-token";
+   // const char* NTFY_USERNAME = "user";
+   // const char* NTFY_PASSWORD = "pass";
+   ```
+3. Flash the firmware again. The device will publish a message to the topic whenever it detects that a service transitioned to a down state.
 
 ## Deploying to ESP32
 
