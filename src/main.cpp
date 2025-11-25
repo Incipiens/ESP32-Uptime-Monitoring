@@ -50,7 +50,12 @@ struct Service {
   String path;
   String expectedResponse;
   int checkInterval;
+  int passThreshold;      // Number of consecutive passes required to mark as UP
+  int failThreshold;      // Number of consecutive fails required to mark as DOWN
+  int consecutivePasses;  // Current count of consecutive passes
+  int consecutiveFails;   // Current count of consecutive fails
   bool isUp;
+  bool notified;          // Whether we've sent a notification for current state
   unsigned long lastCheck;
   unsigned long lastUptime;
   String lastError;
@@ -196,6 +201,10 @@ void initWebServer() {
       obj["path"] = services[i].path;
       obj["expectedResponse"] = services[i].expectedResponse;
       obj["checkInterval"] = services[i].checkInterval;
+      obj["passThreshold"] = services[i].passThreshold;
+      obj["failThreshold"] = services[i].failThreshold;
+      obj["consecutivePasses"] = services[i].consecutivePasses;
+      obj["consecutiveFails"] = services[i].consecutiveFails;
       obj["isUp"] = services[i].isUp;
       obj["secondsSinceLastCheck"] = services[i].secondsSinceLastCheck;
       obj["lastError"] = services[i].lastError;
@@ -245,7 +254,12 @@ void initWebServer() {
       newService.path = doc["path"] | "/";
       newService.expectedResponse = doc["expectedResponse"] | "*";
       newService.checkInterval = doc["checkInterval"] | 60;
+      newService.passThreshold = doc["passThreshold"] | 1;
+      newService.failThreshold = doc["failThreshold"] | 1;
+      newService.consecutivePasses = 0;
+      newService.consecutiveFails = 0;
       newService.isUp = false;
+      newService.notified = false;
       newService.lastCheck = 0;
       newService.lastUptime = 0;
       newService.lastError = "";
@@ -306,6 +320,8 @@ void initWebServer() {
       obj["path"] = services[i].path;
       obj["expectedResponse"] = services[i].expectedResponse;
       obj["checkInterval"] = services[i].checkInterval;
+      obj["passThreshold"] = services[i].passThreshold;
+      obj["failThreshold"] = services[i].failThreshold;
     }
 
     String response;
@@ -378,6 +394,12 @@ void initWebServer() {
         int checkInterval = obj["checkInterval"] | 60;
         if (checkInterval < 10) checkInterval = 10;
 
+        int passThreshold = obj["passThreshold"] | 1;
+        if (passThreshold < 1) passThreshold = 1;
+
+        int failThreshold = obj["failThreshold"] | 1;
+        if (failThreshold < 1) failThreshold = 1;
+
         Service newService;
         newService.id = generateServiceId();
         newService.name = name;
@@ -387,7 +409,12 @@ void initWebServer() {
         newService.path = obj["path"] | "/";
         newService.expectedResponse = obj["expectedResponse"] | "*";
         newService.checkInterval = checkInterval;
+        newService.passThreshold = passThreshold;
+        newService.failThreshold = failThreshold;
+        newService.consecutivePasses = 0;
+        newService.consecutiveFails = 0;
         newService.isUp = false;
+        newService.notified = false;
         newService.lastCheck = 0;
         newService.lastUptime = 0;
         newService.lastError = "";
@@ -431,36 +458,57 @@ void checkServices() {
     services[i].lastCheck = currentTime;
     bool wasUp = services[i].isUp;
 
+    // Perform the actual check
+    bool checkResult = false;
     switch (services[i].type) {
       case TYPE_HOME_ASSISTANT:
-        services[i].isUp = checkHomeAssistant(services[i]);
+        checkResult = checkHomeAssistant(services[i]);
         break;
       case TYPE_JELLYFIN:
-        services[i].isUp = checkJellyfin(services[i]);
+        checkResult = checkJellyfin(services[i]);
         break;
       case TYPE_HTTP_GET:
-        services[i].isUp = checkHttpGet(services[i]);
+        checkResult = checkHttpGet(services[i]);
         break;
       case TYPE_PING:
-        services[i].isUp = checkPing(services[i]);
+        checkResult = checkPing(services[i]);
         break;
     }
 
-    if (services[i].isUp) {
+    // Update consecutive counters based on check result
+    if (checkResult) {
+      services[i].consecutivePasses++;
+      services[i].consecutiveFails = 0;
       services[i].lastUptime = currentTime;
       services[i].lastError = "";
+    } else {
+      services[i].consecutiveFails++;
+      services[i].consecutivePasses = 0;
     }
 
-    // Log status changes
+    // Determine new state based on thresholds
+    if (!services[i].isUp && services[i].consecutivePasses >= services[i].passThreshold) {
+      // Service has passed enough times to be considered UP
+      services[i].isUp = true;
+    } else if (services[i].isUp && services[i].consecutiveFails >= services[i].failThreshold) {
+      // Service has failed enough times to be considered DOWN
+      services[i].isUp = false;
+    }
+
+    // Log and notify on state changes
     if (wasUp != services[i].isUp) {
-      Serial.printf("Service '%s' is now %s\n",
+      Serial.printf("Service '%s' is now %s (after %d consecutive %s)\n",
         services[i].name.c_str(),
-        services[i].isUp ? "UP" : "DOWN");
+        services[i].isUp ? "UP" : "DOWN",
+        services[i].isUp ? services[i].passThreshold : services[i].failThreshold,
+        services[i].isUp ? "passes" : "fails");
 
       if (!services[i].isUp) {
         sendOfflineNotification(services[i]);
+        services[i].notified = true;
       } else if (!firstCheck) {
         sendOnlineNotification(services[i]);
+        services[i].notified = true;
       }
     }
   }
@@ -812,6 +860,8 @@ void saveServices() {
     obj["path"] = services[i].path;
     obj["expectedResponse"] = services[i].expectedResponse;
     obj["checkInterval"] = services[i].checkInterval;
+    obj["passThreshold"] = services[i].passThreshold;
+    obj["failThreshold"] = services[i].failThreshold;
   }
 
   if (serializeJson(doc, file) == 0) {
@@ -851,7 +901,12 @@ void loadServices() {
     services[serviceCount].path = obj["path"].as<String>();
     services[serviceCount].expectedResponse = obj["expectedResponse"].as<String>();
     services[serviceCount].checkInterval = obj["checkInterval"];
+    services[serviceCount].passThreshold = obj["passThreshold"] | 1;
+    services[serviceCount].failThreshold = obj["failThreshold"] | 1;
+    services[serviceCount].consecutivePasses = 0;
+    services[serviceCount].consecutiveFails = 0;
     services[serviceCount].isUp = false;
+    services[serviceCount].notified = false;
     services[serviceCount].lastCheck = 0;
     services[serviceCount].lastUptime = 0;
     services[serviceCount].lastError = "";
@@ -1191,6 +1246,18 @@ String getWebPage() {
                     </div>
                 </div>
 
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="failThreshold">Fail Threshold</label>
+                        <input type="number" id="failThreshold" value="1" required min="1" title="Number of consecutive failures before marking as DOWN">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="passThreshold">Pass Threshold</label>
+                        <input type="number" id="passThreshold" value="1" required min="1" title="Number of consecutive successes before marking as UP">
+                    </div>
+                </div>
+
                 <div class="form-group" id="pathGroup">
                     <label for="servicePath">Path</label>
                     <input type="text" id="servicePath" value="/" placeholder="/">
@@ -1264,7 +1331,9 @@ String getWebPage() {
                 port: parseInt(document.getElementById('servicePort').value),
                 path: document.getElementById('servicePath').value,
                 expectedResponse: document.getElementById('expectedResponse').value,
-                checkInterval: parseInt(document.getElementById('checkInterval').value)
+                checkInterval: parseInt(document.getElementById('checkInterval').value),
+                passThreshold: parseInt(document.getElementById('passThreshold').value),
+                failThreshold: parseInt(document.getElementById('failThreshold').value)
             };
 
             try {
@@ -1351,6 +1420,12 @@ String getWebPage() {
                         ` : ''}
                         <div class="service-info">
                             <strong>Check Interval:</strong> ${service.checkInterval}s
+                        </div>
+                        <div class="service-info">
+                            <strong>Thresholds:</strong> ${service.failThreshold} fail / ${service.passThreshold} pass
+                        </div>
+                        <div class="service-info">
+                            <strong>Consecutive:</strong> ${service.consecutivePasses} passes / ${service.consecutiveFails} fails
                         </div>
                         <div class="service-info">
                             <strong>Last Check:</strong> ${uptimeStr}

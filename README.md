@@ -10,6 +10,7 @@ It serves as a framework to monitor services where support can be hardcoded as a
 - **Jellyfin** server monitoring
 - **HTTP GET** requests with expected response validation
 - **Ping** monitoring
+- **Pass/Fail Thresholds** - Configure how many consecutive successes or failures are required before changing a service's status and sending notifications
 - Optional **ntfy offline notifications** when services go down
 - Optional **Discord webhook notifications** for service up/down events
 - Optional **SMTP email notifications** for service up/down events
