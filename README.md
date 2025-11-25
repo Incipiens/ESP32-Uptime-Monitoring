@@ -15,6 +15,7 @@ It serves as a framework to monitor services where support can be hardcoded as a
 - Optional **SMTP email notifications** for service up/down events
 - Web-based UI for adding and managing services
 - Persistent storage using LittleFS
+- **Export/Import** monitor configurations for backup and restore
 
 ## Prerequisites
 
@@ -193,6 +194,29 @@ Once the ESP32 is running and connected to your WiFi:
 2. Open a web browser on a device connected to the same network
 3. Navigate to `http://<ESP32_IP_ADDRESS>` (e.g., `http://192.168.1.100`)
 4. Use the web interface to add and manage monitoring services
+
+## Backup and Restore Monitor Configurations
+
+The web interface provides export and import functionality to backup and restore your monitor configurations. This is useful when:
+
+- Performing firmware updates that may reset the filesystem
+- Migrating configurations to a different ESP32 device
+- Creating backups before making changes
+
+### Exporting Monitors
+
+1. Click the **Export Monitors** button in the web interface
+2. A JSON file (`monitors-backup.json`) will be downloaded containing all your service configurations
+3. Store this file safely for future restoration
+
+### Importing Monitors
+
+1. Click the **Import Monitors** button in the web interface
+2. Select a previously exported JSON backup file
+3. The services will be added to your current configuration
+4. A message will indicate how many services were imported
+
+**Note:** Importing adds services to existing ones rather than replacing them. If you want to start fresh, delete existing services before importing.
 
 ## Troubleshooting
 

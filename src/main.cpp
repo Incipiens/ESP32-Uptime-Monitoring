@@ -292,6 +292,103 @@ void initWebServer() {
     request->send(200, "application/json", "{\"success\":true}");
   });
 
+  // export services configuration
+  server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray array = doc["services"].to<JsonArray>();
+
+    for (int i = 0; i < serviceCount; i++) {
+      JsonObject obj = array.add<JsonObject>();
+      obj["name"] = services[i].name;
+      obj["type"] = getServiceTypeString(services[i].type);
+      obj["host"] = services[i].host;
+      obj["port"] = services[i].port;
+      obj["path"] = services[i].path;
+      obj["expectedResponse"] = services[i].expectedResponse;
+      obj["checkInterval"] = services[i].checkInterval;
+    }
+
+    String response;
+    serializeJson(doc, response);
+
+    AsyncWebServerResponse *res = request->beginResponse(200, "application/json", response);
+    res->addHeader("Content-Disposition", "attachment; filename=\"monitors-backup.json\"");
+    request->send(res);
+  });
+
+  // import services configuration
+  server.on("/api/import", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+
+      if (error) {
+        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+
+      JsonArray array = doc["services"];
+      if (array.isNull()) {
+        request->send(400, "application/json", "{\"error\":\"Missing services array\"}");
+        return;
+      }
+
+      int importedCount = 0;
+      int skippedCount = 0;
+
+      for (JsonObject obj : array) {
+        if (serviceCount >= MAX_SERVICES) {
+          skippedCount++;
+          continue;
+        }
+
+        String typeStr = obj["type"].as<String>();
+        ServiceType type;
+        if (typeStr == "home_assistant") {
+          type = TYPE_HOME_ASSISTANT;
+        } else if (typeStr == "jellyfin") {
+          type = TYPE_JELLYFIN;
+        } else if (typeStr == "http_get") {
+          type = TYPE_HTTP_GET;
+        } else if (typeStr == "ping") {
+          type = TYPE_PING;
+        } else {
+          skippedCount++;
+          continue;
+        }
+
+        Service newService;
+        newService.id = generateServiceId();
+        newService.name = obj["name"].as<String>();
+        newService.type = type;
+        newService.host = obj["host"].as<String>();
+        newService.port = obj["port"] | 80;
+        newService.path = obj["path"] | "/";
+        newService.expectedResponse = obj["expectedResponse"] | "*";
+        newService.checkInterval = obj["checkInterval"] | 60;
+        newService.isUp = false;
+        newService.lastCheck = 0;
+        newService.lastUptime = 0;
+        newService.lastError = "";
+        newService.secondsSinceLastCheck = -1;
+
+        services[serviceCount++] = newService;
+        importedCount++;
+      }
+
+      saveServices();
+
+      JsonDocument response;
+      response["success"] = true;
+      response["imported"] = importedCount;
+      response["skipped"] = skippedCount;
+
+      String responseStr;
+      serializeJson(response, responseStr);
+      request->send(200, "application/json", responseStr);
+    }
+  );
+
   server.begin();
   Serial.println("Web server started");
 }
@@ -874,6 +971,27 @@ String getWebPage() {
             background: #dc2626;
         }
 
+        .btn-secondary {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #4b5563;
+        }
+
+        .backup-actions {
+            display: flex;
+            gap: 10px;
+            margin-top: 15px;
+            padding-top: 15px;
+            border-top: 1px solid #e5e7eb;
+        }
+
+        .backup-actions input[type="file"] {
+            display: none;
+        }
+
         .services-grid {
             display: grid;
             grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
@@ -1063,6 +1181,12 @@ String getWebPage() {
                 </div>
 
                 <button type="submit" class="btn btn-primary">Add Service</button>
+
+                <div class="backup-actions">
+                    <button type="button" class="btn btn-secondary" onclick="exportServices()">Export Monitors</button>
+                    <label class="btn btn-secondary" for="importFile">Import Monitors</label>
+                    <input type="file" id="importFile" accept=".json" onchange="importServices(this.files[0])">
+                </div>
             </form>
         </div>
 
@@ -1256,6 +1380,40 @@ String getWebPage() {
             setTimeout(() => {
                 alert.remove();
             }, 3000);
+        }
+
+        // Export services
+        function exportServices() {
+            window.location.href = '/api/export';
+        }
+
+        // Import services
+        async function importServices(file) {
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const response = await fetch('/api/import', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: text
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    showAlert(`Imported ${result.imported} service(s)` + 
+                        (result.skipped > 0 ? `, skipped ${result.skipped}` : ''), 'success');
+                    loadServices();
+                } else {
+                    showAlert('Import failed: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+
+            // Reset file input
+            document.getElementById('importFile').value = '';
         }
 
         // Auto-refresh services every 5 seconds
