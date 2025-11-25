@@ -141,11 +141,30 @@ void initWiFi() {
 }
 
 void initFileSystem() {
-  if (!LittleFS.begin(true)) {
-    Serial.println("Failed to mount LittleFS");
+  // First attempt: try to mount without formatting
+  if (LittleFS.begin(false)) {
+    Serial.println("LittleFS mounted successfully");
     return;
   }
-  Serial.println("LittleFS mounted successfully");
+
+  Serial.println("LittleFS mount failed, attempting format...");
+
+  // If mount fails, explicitly format the filesystem first
+  // This handles severely corrupted filesystems better than begin(true)
+  if (!LittleFS.format()) {
+    Serial.println("LittleFS format failed! Check partition table and flash configuration.");
+    return;
+  }
+
+  Serial.println("LittleFS formatted successfully");
+
+  // Now try to mount the freshly formatted filesystem
+  if (!LittleFS.begin(false)) {
+    Serial.println("Critical: Failed to mount LittleFS after successful format!");
+    return;
+  }
+
+  Serial.println("LittleFS mounted successfully after format");
 }
 
 void initWebServer() {
