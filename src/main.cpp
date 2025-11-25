@@ -665,7 +665,7 @@ void saveServices() {
     return;
   }
 
-  DynamicJsonDocument doc(SERVICES_JSON_CAPACITY);
+  JsonDocument doc(SERVICES_JSON_CAPACITY);
   JsonArray array = doc["services"].to<JsonArray>();
 
   for (int i = 0; i < serviceCount; i++) {
@@ -694,7 +694,7 @@ void loadServices() {
     return;
   }
 
-  DynamicJsonDocument doc(SERVICES_JSON_CAPACITY);
+  JsonDocument doc(SERVICES_JSON_CAPACITY);
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
