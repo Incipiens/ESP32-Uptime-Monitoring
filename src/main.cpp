@@ -62,6 +62,9 @@ const int MAX_SERVICES = 20;
 Service services[MAX_SERVICES];
 int serviceCount = 0;
 
+// Allocate enough room for persisting the full services list
+const size_t SERVICES_JSON_CAPACITY = 16384;
+
 // prototype declarations
 void initWiFi();
 void initWebServer();
@@ -662,7 +665,7 @@ void saveServices() {
     return;
   }
 
-  JsonDocument doc;
+  DynamicJsonDocument doc(SERVICES_JSON_CAPACITY);
   JsonArray array = doc["services"].to<JsonArray>();
 
   for (int i = 0; i < serviceCount; i++) {
@@ -677,7 +680,9 @@ void saveServices() {
     obj["checkInterval"] = services[i].checkInterval;
   }
 
-  serializeJson(doc, file);
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to serialize services.json");
+  }
   file.close();
   Serial.println("Services saved");
 }
@@ -689,7 +694,7 @@ void loadServices() {
     return;
   }
 
-  JsonDocument doc;
+  DynamicJsonDocument doc(SERVICES_JSON_CAPACITY);
   DeserializationError error = deserializeJson(doc, file);
   file.close();
 
