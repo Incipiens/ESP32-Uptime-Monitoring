@@ -8,16 +8,7 @@
 #include <HTTPClient.h>
 #include <ESP32Ping.h>
 
-// WiFi credentials, need to update these with your network details
-const char* WIFI_SSID = "xxx";
-const char* WIFI_PASSWORD = "xxx";
-
-// ntfy configuration - set NTFY_TOPIC to enable notifications
-const char* NTFY_SERVER = "https://ntfy.sh"; // Change to your self-hosted server if needed
-const char* NTFY_TOPIC = "";                 // Example: "esp32-uptime"
-const char* NTFY_ACCESS_TOKEN = "";           // Optional: bearer token for authenticated servers
-const char* NTFY_USERNAME = "";               // Optional: basic auth username
-const char* NTFY_PASSWORD = "";               // Optional: basic auth password
+#include "config.hpp"
 
 bool isNtfyConfigured() {
   return strlen(NTFY_TOPIC) > 0;
