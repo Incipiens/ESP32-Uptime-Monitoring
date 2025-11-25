@@ -70,7 +70,7 @@ Set an ntfy topic to receive alerts whenever a monitored service goes offline. O
    // const char* NTFY_USERNAME = "user";
    // const char* NTFY_PASSWORD = "pass";
    ```
-3. Flash the firmware again. The device will publish a message to the topic whenever it detects that a service transitioned to a down state.
+3. Flash the firmware again. The device will publish a message to the topic whenever it detects that a service transitioned to a down state, and another when the service comes back online.
 
 ## Deploying to ESP32
 

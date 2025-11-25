@@ -14,7 +14,7 @@ bool isNtfyConfigured() {
   return strlen(NTFY_TOPIC) > 0;
 }
 
-void sendNtfyNotification(const String& title, const String& message);
+void sendNtfyNotification(const String& title, const String& message, const String& tags = "warning,monitor");
 
 AsyncWebServer server(80);
 
@@ -59,6 +59,7 @@ void saveServices();
 String generateServiceId();
 void checkServices();
 void sendOfflineNotification(const Service& service);
+void sendOnlineNotification(const Service& service);
 bool checkHomeAssistant(Service& service);
 bool checkJellyfin(Service& service);
 bool checkHttpGet(Service& service);
@@ -304,6 +305,8 @@ void checkServices() {
 
       if (!services[i].isUp) {
         sendOfflineNotification(services[i]);
+      } else {
+        sendOnlineNotification(services[i]);
       }
     }
   }
@@ -415,10 +418,30 @@ void sendOfflineNotification(const Service& service) {
     message += " Error: " + service.lastError;
   }
 
-  sendNtfyNotification(title, message);
+  sendNtfyNotification(title, message, "warning,monitor");
 }
 
-void sendNtfyNotification(const String& title, const String& message) {
+void sendOnlineNotification(const Service& service) {
+  if (!isNtfyConfigured()) {
+    return;
+  }
+
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("Skipping ntfy notification: WiFi not connected");
+    return;
+  }
+
+  String title = "Service UP: " + service.name;
+  String message = "Service '" + service.name + "' at " + service.host;
+  if (service.port > 0) {
+    message += ":" + String(service.port);
+  }
+  message += " is back online.";
+
+  sendNtfyNotification(title, message, "ok,monitor");
+}
+
+void sendNtfyNotification(const String& title, const String& message, const String& tags) {
   HTTPClient http;
   String url = String(NTFY_SERVER) + "/" + NTFY_TOPIC;
 
@@ -431,7 +454,7 @@ void sendNtfyNotification(const String& title, const String& message) {
     http.begin(url);
   }
   http.addHeader("Title", title);
-  http.addHeader("Tags", "warning,monitor");
+  http.addHeader("Tags", tags);
   http.addHeader("Content-Type", "text/plain");
 
   if (strlen(NTFY_ACCESS_TOKEN) > 0) {
