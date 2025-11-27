@@ -4,6 +4,10 @@
 extern const char* WIFI_SSID;
 extern const char* WIFI_PASSWORD;
 
+// Web authentication (Basic Auth)
+extern const char* WEB_AUTH_USERNAME;
+extern const char* WEB_AUTH_PASSWORD;
+
 // ntfy configuration
 extern const char* NTFY_SERVER;
 extern const char* NTFY_TOPIC;
