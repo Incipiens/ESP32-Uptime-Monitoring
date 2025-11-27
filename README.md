@@ -2,7 +2,7 @@
 
 A basic uptime monitor written for the ESP32. It was written for an XDA article.
 
-It serves as a framework to monitor services where support can be hardcoded as a type, making it expandable. Users can also add their own GET requests and ping requests, so that it can support any service. You can't set any authorization, which is a limitation of this application, though could be added in the form processing.
+It serves as a framework to monitor services where support can be hardcoded as a type, making it expandable. Users can also add their own GET requests and ping requests, so that it can support any service.
 
 ## Features
 
@@ -52,6 +52,17 @@ Before deploying, you need to configure your WiFi credentials:
    const char* WIFI_SSID = "YourNetworkName";
    const char* WIFI_PASSWORD = "YourPassword";
    ```
+
+### Protecting the web interface
+
+Optional HTTP Basic Authentication can be enabled to prevent unauthenticated users from adding, importing, or deleting services.
+
+Add the following values to `src/config.cpp` (or provide them via PlatformIO build flags) to require credentials when accessing the interface or modifying services:
+
+```cpp
+const char* WEB_AUTH_USERNAME = "admin";
+const char* WEB_AUTH_PASSWORD = "strong-password";
+```
 
 ### Enabling ntfy notifications
 

@@ -19,6 +19,14 @@
 #define WIFI_PASSWORD_VALUE "xxx"
 #endif
 
+#ifndef WEB_AUTH_USERNAME_VALUE
+#define WEB_AUTH_USERNAME_VALUE ""
+#endif
+
+#ifndef WEB_AUTH_PASSWORD_VALUE
+#define WEB_AUTH_PASSWORD_VALUE ""
+#endif
+
 #ifndef NTFY_SERVER_VALUE
 #define NTFY_SERVER_VALUE "https://ntfy.sh"
 #endif
@@ -73,6 +81,9 @@
 
 const char* WIFI_SSID = WIFI_SSID_VALUE;
 const char* WIFI_PASSWORD = WIFI_PASSWORD_VALUE;
+
+const char* WEB_AUTH_USERNAME = WEB_AUTH_USERNAME_VALUE;
+const char* WEB_AUTH_PASSWORD = WEB_AUTH_PASSWORD_VALUE;
 
 const char* NTFY_SERVER = NTFY_SERVER_VALUE;
 const char* NTFY_TOPIC = NTFY_TOPIC_VALUE;

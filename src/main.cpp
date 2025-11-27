@@ -70,6 +70,7 @@ int serviceCount = 0;
 void initWiFi();
 void initWebServer();
 void initFileSystem();
+bool ensureAuthenticated(AsyncWebServerRequest* request);
 void loadServices();
 void saveServices();
 String generateServiceId();
@@ -144,6 +145,19 @@ void initWiFi() {
   }
 }
 
+bool ensureAuthenticated(AsyncWebServerRequest* request) {
+  if (strlen(WEB_AUTH_USERNAME) == 0 || strlen(WEB_AUTH_PASSWORD) == 0) {
+    return true;
+  }
+
+  if (request->authenticate(WEB_AUTH_USERNAME, WEB_AUTH_PASSWORD)) {
+    return true;
+  }
+
+  request->requestAuthentication();
+  return false;
+}
+
 void initFileSystem() {
   // First attempt: try to mount without formatting
   if (LittleFS.begin(false)) {
@@ -174,6 +188,9 @@ void initFileSystem() {
 void initWebServer() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!ensureAuthenticated(request)) {
+      return;
+    }
     request->send(200, "text/html", getWebPage());
   });
 
@@ -217,6 +234,9 @@ void initWebServer() {
   // add service
   server.on("/api/services", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (!ensureAuthenticated(request)) {
+        return;
+      }
       if (serviceCount >= MAX_SERVICES) {
         request->send(400, "application/json", "{\"error\":\"Maximum services reached\"}");
         return;
@@ -285,6 +305,9 @@ void initWebServer() {
 
   // delete service
   server.on("/api/services/*", HTTP_DELETE, [](AsyncWebServerRequest *request) {
+    if (!ensureAuthenticated(request)) {
+      return;
+    }
     String path = request->url();
     String serviceId = path.substring(path.lastIndexOf('/') + 1);
 
@@ -340,6 +363,9 @@ void initWebServer() {
   // import services configuration
   server.on("/api/import", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (!ensureAuthenticated(request)) {
+        return;
+      }
       // Limit payload size to 16KB to prevent DoS
       if (total > 16384) {
         request->send(400, "application/json", "{\"error\":\"Payload too large\"}");
