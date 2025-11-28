@@ -46,6 +46,7 @@ bool meshDeviceConnected = false;
 unsigned long lastMeshConnectAttempt = 0;
 String lastMeshError = "";
 bool meshChannelReady = false;
+const int BLE_MTU_NEGOTIATION_DELAY_MS = 500;
 
 // UUIDs derived from random generator to avoid collisions
 const char* MESHCORE_SERVICE_UUID = "8b9b0b3d-1e1d-4e91-9c23-4c1e1a4f0a2d";
@@ -266,6 +267,10 @@ bool connectToMeshCore() {
       lastMeshError = "Connection attempt failed";
       continue;
     }
+
+    // Allow MTU negotiation to complete before accessing services
+    // This prevents GATT_BUSY errors (GATTC_ConfigureMTU GATT_BUSY)
+    delay(BLE_MTU_NEGOTIATION_DELAY_MS);
 
     BLERemoteService* service = meshClient->getService(MESHCORE_SERVICE_UUID);
     if (service == nullptr) {
