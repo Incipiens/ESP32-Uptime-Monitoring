@@ -31,6 +31,7 @@ void sendNtfyNotification(const String& title, const String& message, const Stri
 void sendDiscordNotification(const String& title, const String& message);
 void sendSmtpNotification(const String& title, const String& message);
 void sendMeshCoreNotification(const String& title, const String& message);
+void scanBLEDevices();
 void initBLE();
 bool connectToMeshCore();
 void disconnectFromMeshCore();
@@ -141,11 +142,11 @@ void setup() {
   // Initialize filesystem
   initFileSystem();
 
-  // Note: BLE is NOT initialized at startup to avoid conflicts with WiFi.
-  // ESP32-S3 cannot run WiFi and BLE simultaneously. BLE will be
-  // initialized on-demand when a MeshCore notification is needed.
+  // Scan for BLE devices at boot and log them to serial monitor
+  // This runs before WiFi to avoid ESP32-S3 WiFi/BLE coexistence issues
+  scanBLEDevices();
 
-  // Initialize WiFi
+  // Initialize WiFi (BLE is deinitialized after scan to allow this)
   initWiFi();
 
   // Load saved services
@@ -218,6 +219,71 @@ void initBLE() {
   security->setStaticPIN(BLE_PAIRING_PIN);
 
   connectToMeshCore();
+}
+
+void scanBLEDevices() {
+  Serial.println("Starting BLE device scan...");
+  
+  // Initialize BLE for scanning
+  BLEDevice::init(BLE_DEVICE_NAME);
+  
+  if (!BLEDevice::getInitialized()) {
+    Serial.println("BLE initialization failed, cannot scan for devices");
+    return;
+  }
+  
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  scan->setInterval(100);
+  scan->setWindow(99);
+  
+  const int scanSeconds = 5;
+  Serial.printf("Scanning for BLE devices for %d seconds...\n", scanSeconds);
+  
+  BLEScanResults results = scan->start(scanSeconds, false);
+  int deviceCount = results.getCount();
+  
+  if (deviceCount < 0) {
+    Serial.println("BLE scan failed");
+    BLEDevice::deinit();
+    return;
+  }
+  
+  Serial.println("========================================");
+  Serial.printf("BLE Scan Complete: %d device(s) found\n", deviceCount);
+  Serial.println("========================================");
+  
+  for (int i = 0; i < deviceCount; i++) {
+    const BLEAdvertisedDevice& device = results.getDevice(i);
+    
+    std::string rawName = device.getName();
+    String devName = rawName.length() ? String(rawName.c_str()) : String("(unnamed)");
+    String devAddr = String(device.getAddress().toString().c_str());
+    int rssi = device.getRSSI();
+    
+    Serial.printf("[%d] Name: %s\n", i + 1, devName.c_str());
+    Serial.printf("    Address: %s\n", devAddr.c_str());
+    Serial.printf("    RSSI: %d dBm\n", rssi);
+    
+    if (device.haveServiceUUID()) {
+      BLEUUID serviceUUID = device.getServiceUUID();
+      Serial.printf("    Service UUID: %s\n", serviceUUID.toString().c_str());
+    }
+    
+    if (device.haveManufacturerData()) {
+      Serial.println("    Manufacturer data: present");
+    }
+    
+    Serial.println("----------------------------------------");
+  }
+  
+  // Clean up scan results before deinitializing BLE
+  scan->clearResults();
+  
+  // Deinitialize BLE so WiFi can be used
+  BLEDevice::deinit();
+  
+  Serial.println("BLE scan complete, BLE deinitialized for WiFi usage");
 }
 
 bool ensureAuthenticated(AsyncWebServerRequest* request) {
