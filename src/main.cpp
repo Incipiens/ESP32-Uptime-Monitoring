@@ -120,7 +120,7 @@ const size_t MAX_TEXT_MESSAGE_LEN = 140;
 // RX buffer for storing received BLE notification payload
 const int MESH_RX_BUFFER_SIZE = 256;
 uint8_t meshRxBuffer[MESH_RX_BUFFER_SIZE];
-int meshRxBufferPos = 0;
+int meshRxPayloadLen = 0;  // Length of current payload in buffer
 volatile bool meshResponseReceived = false;
 uint8_t meshLastResponseCode = 0xFF;
 
@@ -152,19 +152,22 @@ void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData
     return;
   }
   
+  // Reject oversized payloads to prevent buffer overflow and data corruption
+  if (length > MESH_RX_BUFFER_SIZE) {
+    Serial.printf("MeshCore RX: payload too large (%d > %d), rejecting frame\n", 
+                  (int)length, MESH_RX_BUFFER_SIZE);
+    meshRxPayloadLen = 0;
+    meshResponseReceived = false;
+    return;
+  }
+  
   // First byte is the response code
   meshLastResponseCode = pData[0];
   Serial.printf("MeshCore RX: response code 0x%02X, length %d\n", meshLastResponseCode, (int)length);
   
-  // Store the payload in the buffer for any code that might need to parse additional data
-  size_t bytesToCopy = length;
-  if (bytesToCopy > MESH_RX_BUFFER_SIZE) {
-    Serial.printf("MeshCore RX: payload too large, truncating from %d to %d bytes\n", 
-                  (int)length, MESH_RX_BUFFER_SIZE);
-    bytesToCopy = MESH_RX_BUFFER_SIZE;
-  }
-  memcpy(meshRxBuffer, pData, bytesToCopy);
-  meshRxBufferPos = bytesToCopy;
+  // Store the complete payload in the buffer for any code that might need to parse additional data
+  memcpy(meshRxBuffer, pData, length);
+  meshRxPayloadLen = length;
   
   meshResponseReceived = true;
 }
@@ -492,7 +495,7 @@ bool connectToMeshCore() {
   meshRxCharacteristic = nullptr;
   meshChannelReady = false;
   meshProtocolState = MESH_STATE_DISCONNECTED;
-  meshRxBufferPos = 0;
+  meshRxPayloadLen = 0;
 
   Serial.printf("Scanning for MeshCore peer named '%s' (extended debug)...\n", BLE_PEER_NAME);
 
@@ -699,7 +702,7 @@ void disconnectFromMeshCore() {
   meshRxCharacteristic = nullptr;
   meshChannelReady = false;
   meshProtocolState = MESH_STATE_DISCONNECTED;
-  meshRxBufferPos = 0;
+  meshRxPayloadLen = 0;
   
   // Only deinitialize BLE if it was initialized
   if (bleInitialized) {
