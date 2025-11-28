@@ -48,7 +48,9 @@ bool meshDeviceConnected = false;
 unsigned long lastMeshConnectAttempt = 0;
 String lastMeshError = "";
 bool meshChannelReady = false;
-const int BLE_MTU_NEGOTIATION_DELAY_MS = 500;
+const int BLE_MTU_NEGOTIATION_DELAY_MS = 1500;
+const int BLE_SERVICE_DISCOVERY_RETRIES = 3;
+const int BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS = 500;
 
 // BLE/WiFi coexistence - ESP32-S3 cannot run WiFi and BLE simultaneously
 bool bleOperationInProgress = false;
@@ -283,7 +285,19 @@ bool connectToMeshCore() {
     // This prevents GATT_BUSY errors (GATTC_ConfigureMTU GATT_BUSY)
     delay(BLE_MTU_NEGOTIATION_DELAY_MS);
 
-    BLERemoteService* service = meshClient->getService(MESHCORE_SERVICE_UUID);
+    // Retry service discovery to handle cases where MTU negotiation
+    // may still be completing (causes GATT_BUSY errors)
+    BLERemoteService* service = nullptr;
+    for (int retry = 0; retry < BLE_SERVICE_DISCOVERY_RETRIES; retry++) {
+      service = meshClient->getService(MESHCORE_SERVICE_UUID);
+      if (service != nullptr) {
+        break;
+      }
+      if (retry < BLE_SERVICE_DISCOVERY_RETRIES - 1) {
+        Serial.printf("Service discovery attempt %d failed, retrying...\n", retry + 1);
+        delay(BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS);
+      }
+    }
     if (service == nullptr) {
       lastMeshError = "MeshCore service not found on peer";
       meshClient->disconnect();
