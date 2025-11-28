@@ -654,15 +654,10 @@ bool connectToMeshCore() {
     }
 
     // Register for notifications and fail fast if subscription cannot be created
-    if (!rxChar->registerForNotify(meshNotifyCallback)) {
-      lastMeshError = "Failed to register MeshCore RX notifications";
-      Serial.println("Failed to register MeshCore RX notifications, disconnecting...");
-      meshClient->disconnect();
-      continue;
-    }
+    rxChar->registerForNotify(meshNotifyCallback);
 
     // Explicitly enable notifications on the CCCD to ensure the peer sends responses
-    BLEDescriptor* cccd = rxChar->getDescriptor(BLEUUID((uint16_t)0x2902));
+    BLERemoteDescriptor* cccd = rxChar->getDescriptor(BLEUUID((uint16_t)0x2902));
     if (cccd != nullptr) {
       uint8_t notifyOn[] = {0x01, 0x00};
       cccd->writeValue(notifyOn, sizeof(notifyOn), true);
