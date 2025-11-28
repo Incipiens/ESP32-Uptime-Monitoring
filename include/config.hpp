@@ -8,6 +8,9 @@ extern const char* WIFI_PASSWORD;
 extern const char* WEB_AUTH_USERNAME;
 extern const char* WEB_AUTH_PASSWORD;
 
+// BLE configuration
+extern const char* BLE_DEVICE_NAME;
+
 // ntfy configuration
 extern const char* NTFY_SERVER;
 extern const char* NTFY_TOPIC;
