@@ -352,7 +352,7 @@ bool provisionMeshChannel() {
   Serial.printf("Provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
   try {
     meshMessageCharacteristic->writeValue(
-      reinterpret_cast<const uint8_t*>(payload.c_str()),
+      const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
       payload.length(),
       false
     );
@@ -1013,7 +1013,7 @@ void sendMeshCoreNotification(const String& title, const String& message) {
   serializeJson(doc, payload);
 
   meshMessageCharacteristic->writeValue(
-    reinterpret_cast<const uint8_t*>(payload.c_str()),
+    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
     payload.length(),
     false
   );
