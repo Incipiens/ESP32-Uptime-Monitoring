@@ -207,14 +207,20 @@ void initWiFi() {
 
 void initBLE() {
   Serial.println("Initializing BLE MeshCore client...");
+  Serial.printf("Free heap before BLE init: %d bytes\n", ESP.getFreeHeap());
+  
   BLEDevice::init(BLE_DEVICE_NAME);
   
   // Verify initialization succeeded before continuing
   if (!BLEDevice::getInitialized()) {
-    Serial.println("BLE initialization failed");
+    Serial.println("ERROR: BLE initialization failed - check if Bluetooth is enabled in sdkconfig");
+    Serial.println("Common causes: insufficient memory, Bluetooth disabled in build configuration, or hardware issue");
+    Serial.printf("Free heap after failed init: %d bytes\n", ESP.getFreeHeap());
     return;
   }
   bleInitialized = true;
+  Serial.printf("BLE initialized successfully as '%s'\n", BLE_DEVICE_NAME);
+  Serial.printf("Free heap after BLE init: %d bytes\n", ESP.getFreeHeap());
 
   // Set up PIN-based pairing to satisfy MeshCore's security expectations
   BLESecurity* security = new BLESecurity();
@@ -227,15 +233,28 @@ void initBLE() {
 }
 
 void scanBLEDevices() {
+  Serial.println("========================================");
   Serial.println("Starting BLE device scan...");
+  Serial.println("========================================");
+  
+  // Log available heap before BLE initialization for debugging memory issues
+  Serial.printf("Free heap before BLE init: %d bytes\n", ESP.getFreeHeap());
   
   // Initialize BLE for scanning
   BLEDevice::init(BLE_DEVICE_NAME);
   
   if (!BLEDevice::getInitialized()) {
-    Serial.println("BLE initialization failed, cannot scan for devices");
+    Serial.println("ERROR: BLE initialization failed, cannot scan for devices");
+    Serial.println("Possible causes:");
+    Serial.println("  - Bluetooth disabled in build configuration (CONFIG_BT_ENABLED)");
+    Serial.println("  - Insufficient heap memory for BLE stack");
+    Serial.println("  - Hardware issue with the ESP32 Bluetooth radio");
+    Serial.printf("Free heap after failed init: %d bytes\n", ESP.getFreeHeap());
     return;
   }
+  
+  Serial.printf("BLE initialized successfully as '%s'\n", BLE_DEVICE_NAME);
+  Serial.printf("Free heap after BLE init: %d bytes\n", ESP.getFreeHeap());
   
   BLEScan* scan = BLEDevice::getScan();
   scan->setActiveScan(true);
@@ -286,10 +305,13 @@ void scanBLEDevices() {
   // Clean up scan results before deinitializing BLE
   scan->clearResults();
   
-  // Deinitialize BLE so WiFi can be used
+  // Deinitialize BLE so WiFi can be used (ESP32-S3 cannot run both simultaneously)
   BLEDevice::deinit();
   
+  Serial.println("========================================");
   Serial.println("BLE scan complete, BLE deinitialized for WiFi usage");
+  Serial.println("NOTE: BLE will be re-initialized on-demand when sending MeshCore notifications");
+  Serial.println("========================================");
 }
 
 bool ensureAuthenticated(AsyncWebServerRequest* request) {
