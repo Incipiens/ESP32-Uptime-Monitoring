@@ -33,7 +33,9 @@ void sendSmtpNotification(const String& title, const String& message);
 void sendMeshCoreNotification(const String& title, const String& message);
 void initBLE();
 bool connectToMeshCore();
-void maintainMeshCoreLink();
+void disconnectFromMeshCore();
+void disconnectWiFi();
+void reconnectWiFi();
 bool ensureMeshChannel();
 bool provisionMeshChannel();
 
@@ -47,6 +49,10 @@ unsigned long lastMeshConnectAttempt = 0;
 String lastMeshError = "";
 bool meshChannelReady = false;
 const int BLE_MTU_NEGOTIATION_DELAY_MS = 500;
+
+// BLE/WiFi coexistence - ESP32-S3 cannot run WiFi and BLE simultaneously
+bool bleOperationInProgress = false;
+bool monitoringPaused = false;
 
 // UUIDs derived from random generator to avoid collisions
 const char* MESHCORE_SERVICE_UUID = "8b9b0b3d-1e1d-4e91-9c23-4c1e1a4f0a2d";
@@ -131,8 +137,9 @@ void setup() {
   // Initialize filesystem
   initFileSystem();
 
-  // Initialize BLE for MeshCore interoperability
-  initBLE();
+  // Note: BLE is NOT initialized at startup to avoid conflicts with WiFi.
+  // ESP32-S3 cannot run WiFi and BLE simultaneously. BLE will be
+  // initialized on-demand when a MeshCore notification is needed.
 
   // Initialize WiFi
   initWiFi();
@@ -152,7 +159,11 @@ void loop() {
   static unsigned long lastCheckTime = 0;
   unsigned long currentTime = millis();
 
-  maintainMeshCoreLink();
+  // Skip service checks if monitoring is paused (e.g., during BLE operations)
+  if (monitoringPaused) {
+    delay(10);
+    return;
+  }
 
   // Check services every 5 seconds
   if (currentTime - lastCheckTime >= 5000) {
@@ -309,17 +320,47 @@ bool connectToMeshCore() {
   return false;
 }
 
-void maintainMeshCoreLink() {
-  unsigned long now = millis();
-  if (meshDeviceConnected && meshClient != nullptr && meshClient->isConnected()) {
-    return;
+void disconnectFromMeshCore() {
+  if (meshClient != nullptr && meshClient->isConnected()) {
+    Serial.println("Disconnecting from MeshCore...");
+    meshClient->disconnect();
+  }
+  meshDeviceConnected = false;
+  meshMessageCharacteristic = nullptr;
+  meshChannelReady = false;
+  
+  // Deinitialize BLE to free resources for WiFi
+  BLEDevice::deinit();
+  Serial.println("BLE deinitialized");
+}
+
+void disconnectWiFi() {
+  Serial.println("Disconnecting WiFi for BLE operation...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100); // Allow WiFi to fully shut down
+  Serial.println("WiFi disconnected");
+}
+
+void reconnectWiFi() {
+  Serial.println("Reconnecting WiFi after BLE operation...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
   }
 
-  if (now - lastMeshConnectAttempt < 10000) {
-    return;
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi reconnected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to reconnect to WiFi!");
   }
-
-  connectToMeshCore();
 }
 
 bool ensureMeshChannel() {
@@ -388,6 +429,8 @@ void initWebServer() {
     doc["channel"] = BLE_MESH_CHANNEL_NAME;
     doc["channelReady"] = meshChannelReady;
     doc["lastError"] = lastMeshError;
+    doc["bleOperationInProgress"] = bleOperationInProgress;
+    doc["monitoringPaused"] = monitoringPaused;
 
     String response;
     serializeJson(doc, response);
@@ -400,13 +443,9 @@ void initWebServer() {
         return;
       }
 
-      if ((!meshDeviceConnected || meshMessageCharacteristic == nullptr) && !connectToMeshCore()) {
-        request->send(503, "application/json", "{\"error\":\"MeshCore device not connected\"}");
-        return;
-      }
-
-      if (!ensureMeshChannel()) {
-        request->send(503, "application/json", "{\"error\":\"MeshCore channel unavailable\"}");
+      // Check if a BLE operation is already in progress
+      if (bleOperationInProgress) {
+        request->send(503, "application/json", "{\"error\":\"BLE operation already in progress\"}");
         return;
       }
 
@@ -423,9 +462,14 @@ void initWebServer() {
         return;
       }
 
+      // Note: sendMeshCoreNotification handles WiFi/BLE switching internally
+      // The response is sent before the operation completes because the async
+      // web server would timeout during the WiFi/BLE switch.
+      // The actual sending happens synchronously after the response.
+      request->send(202, "application/json", "{\"success\":true,\"status\":\"queued\"}");
+      
+      // Send the notification (this blocks while doing WiFi/BLE switch)
       sendMeshCoreNotification(title, message);
-
-      request->send(200, "application/json", "{\"success\":true}");
     }
   );
 
@@ -998,30 +1042,61 @@ void sendDiscordNotification(const String& title, const String& message) {
 }
 
 void sendMeshCoreNotification(const String& title, const String& message) {
-  if ((!meshDeviceConnected || meshMessageCharacteristic == nullptr) && !connectToMeshCore()) {
+  // ESP32-S3 cannot run WiFi and BLE simultaneously
+  // Disconnect WiFi, connect BLE, send message, disconnect BLE, reconnect WiFi
+  
+  Serial.println("Starting MeshCore notification (BLE operation)...");
+  
+  // Pause monitoring to prevent false positives during network transition
+  monitoringPaused = true;
+  bleOperationInProgress = true;
+  
+  // Disconnect WiFi before starting BLE
+  disconnectWiFi();
+  
+  // Initialize BLE (on-demand, since we deinit after each use)
+  initBLE();
+  
+  // Try to connect and send message
+  if (meshDeviceConnected && meshMessageCharacteristic != nullptr) {
+    if (ensureMeshChannel()) {
+      JsonDocument doc;
+      doc["channel"] = BLE_MESH_CHANNEL_NAME;
+      doc["key"] = BLE_MESH_CHANNEL_KEY;
+      doc["title"] = title;
+      doc["body"] = message;
+
+      String payload;
+      serializeJson(doc, payload);
+
+      try {
+        meshMessageCharacteristic->writeValue(
+          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
+          payload.length(),
+          false
+        );
+        Serial.println("MeshCore notification sent successfully");
+      } catch (...) {
+        Serial.println("MeshCore notification failed: write error");
+      }
+    } else {
+      Serial.println("MeshCore notification skipped: channel not ready");
+    }
+  } else {
     Serial.println("MeshCore notification skipped: not connected");
-    return;
   }
-
-  if (!ensureMeshChannel()) {
-    Serial.println("MeshCore notification skipped: channel not ready");
-    return;
-  }
-
-  JsonDocument doc;
-  doc["channel"] = BLE_MESH_CHANNEL_NAME;
-  doc["key"] = BLE_MESH_CHANNEL_KEY;
-  doc["title"] = title;
-  doc["body"] = message;
-
-  String payload;
-  serializeJson(doc, payload);
-
-  meshMessageCharacteristic->writeValue(
-    const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
-    payload.length(),
-    false
-  );
+  
+  // Disconnect BLE and deinitialize to free resources
+  disconnectFromMeshCore();
+  
+  // Reconnect WiFi
+  reconnectWiFi();
+  
+  // Resume monitoring
+  bleOperationInProgress = false;
+  monitoringPaused = false;
+  
+  Serial.println("MeshCore notification operation complete");
 }
 
 String base64Encode(const String& input) {
