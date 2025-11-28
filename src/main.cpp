@@ -311,11 +311,19 @@ void loop() {
   // This runs in the main loop to avoid blocking the async web server
   // and prevents task watchdog timeouts from WiFi/BLE switching during HTTP responses
   if (pendingMeshNotification && !bleOperationInProgress) {
+    // Copy values and clear flag atomically to prevent race conditions with HTTP handler.
+    // The HTTP handler checks both pendingMeshNotification and bleOperationInProgress
+    // before writing, so setting the flag false first prevents new writes.
+    // We use noInterrupts()/interrupts() to ensure the copy is atomic since
+    // the async web server runs in a separate FreeRTOS task.
+    noInterrupts();
     pendingMeshNotification = false;
     String title = pendingMeshTitle;
     String message = pendingMeshMessage;
     pendingMeshTitle = "";
     pendingMeshMessage = "";
+    interrupts();
+    
     sendMeshCoreNotification(title, message);
   }
 
@@ -976,9 +984,13 @@ void initWebServer() {
       // to fully complete HTTP response delivery before WiFi is disconnected
       // for BLE operations. The ESP32-S3 cannot run WiFi and BLE simultaneously,
       // so we must ensure the HTTP response is sent before switching to BLE.
+      // Use noInterrupts()/interrupts() to ensure atomic write since the main
+      // loop() reads these variables from a different FreeRTOS task context.
+      noInterrupts();
       pendingMeshTitle = title;
       pendingMeshMessage = message;
       pendingMeshNotification = true;
+      interrupts();
       
       request->send(202, "application/json", "{\"success\":true,\"status\":\"queued\"}");
     }
