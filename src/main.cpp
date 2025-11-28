@@ -270,6 +270,9 @@ bool connectToMeshCore() {
 
   BLEScan* scan = BLEDevice::getScan();
   scan->setActiveScan(true);
+  // Tighten scan timing to improve chances of catching short MeshCore adverts
+  scan->setInterval(200);
+  scan->setWindow(160);
 
   const int scanSeconds = 10;
   BLEScanResults results = scan->start(scanSeconds, false);
@@ -320,7 +323,10 @@ bool connectToMeshCore() {
       meshClient->setClientCallbacks(new MeshClientCallbacks());
     }
 
-    if (!meshClient->connect(&device)) {
+    // Copy the address so we don't rely on the temporary BLEAdvertisedDevice
+    BLEAddress peerAddress = device.getAddress();
+
+    if (!meshClient->connect(peerAddress)) {
       lastMeshError = "Connection attempt failed";
       Serial.println("Connection attempt failed");
       continue;
@@ -377,6 +383,9 @@ bool connectToMeshCore() {
 
     return true;
   }
+
+  // Free scan results so the BLE stack can reuse memory on the next attempt
+  scan->clearResults();
 
   lastMeshError = "MeshCore peer not found during scan";
   Serial.println(lastMeshError.c_str());
