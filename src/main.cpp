@@ -321,7 +321,7 @@ bool connectToMeshCore() {
     if (meshClient == nullptr) {
       meshClient = BLEDevice::createClient();
       meshClient->setClientCallbacks(new MeshClientCallbacks());
-      meshClient->setConnectTimeout(5000);
+      //meshClient->setConnectTimeout(5000);
     }
 
     // Copy the address so we don't rely on the temporary BLEAdvertisedDevice
