@@ -9,7 +9,7 @@
 #include <ESP32Ping.h>
 #include <mbedtls/base64.h>
 #include <BLEDevice.h>
-#include <BLEServer.h>
+#include <BLESecurity.h>
 #include <BLEUtils.h>
 
 #include "config.hpp"
@@ -32,31 +32,34 @@ void sendDiscordNotification(const String& title, const String& message);
 void sendSmtpNotification(const String& title, const String& message);
 void sendMeshCoreNotification(const String& title, const String& message);
 void initBLE();
-void updateMeshCoreStatusCharacteristic();
+bool connectToMeshCore();
+void maintainMeshCoreLink();
+bool ensureMeshChannel();
+bool provisionMeshChannel();
 
 AsyncWebServer server(80);
 
 // BLE / MeshCore
-BLEServer* bleServer = nullptr;
-BLECharacteristic* meshMessageCharacteristic = nullptr;
-BLECharacteristic* meshStatusCharacteristic = nullptr;
+BLEClient* meshClient = nullptr;
+BLERemoteCharacteristic* meshMessageCharacteristic = nullptr;
 bool meshDeviceConnected = false;
+unsigned long lastMeshConnectAttempt = 0;
+String lastMeshError = "";
+bool meshChannelReady = false;
 
 // UUIDs derived from random generator to avoid collisions
 const char* MESHCORE_SERVICE_UUID = "8b9b0b3d-1e1d-4e91-9c23-4c1e1a4f0a2d";
 const char* MESHCORE_MESSAGE_CHAR_UUID = "0b5ad4e1-a62f-41a8-99a1-86a9b8b43964";
-const char* MESHCORE_STATUS_CHAR_UUID = "5c4e5e3c-0caa-4b6d-9dff-19b3e3ea1a4c";
 
-class MeshServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* server) override {
+class MeshClientCallbacks : public BLEClientCallbacks {
+  void onConnect(BLEClient* client) override {
     meshDeviceConnected = true;
-    updateMeshCoreStatusCharacteristic();
+    lastMeshError = "";
   }
 
-  void onDisconnect(BLEServer* server) override {
+  void onDisconnect(BLEClient* client) override {
     meshDeviceConnected = false;
-    updateMeshCoreStatusCharacteristic();
-    server->getAdvertising()->start();
+    meshChannelReady = false;
   }
 };
 
@@ -148,6 +151,8 @@ void loop() {
   static unsigned long lastCheckTime = 0;
   unsigned long currentTime = millis();
 
+  maintainMeshCoreLink();
+
   // Check services every 5 seconds
   if (currentTime - lastCheckTime >= 5000) {
     checkServices();
@@ -179,41 +184,17 @@ void initWiFi() {
 }
 
 void initBLE() {
-  Serial.println("Starting BLE MeshCore bridge...");
+  Serial.println("Initializing BLE MeshCore client...");
   BLEDevice::init(BLE_DEVICE_NAME);
 
-  bleServer = BLEDevice::createServer();
-  bleServer->setCallbacks(new MeshServerCallbacks());
+  // Set up PIN-based pairing to satisfy MeshCore's security expectations
+  BLESecurity* security = new BLESecurity();
+  security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
+  security->setCapability(ESP_IO_CAP_OUT);
+  security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+  security->setStaticPIN(BLE_PAIRING_PIN);
 
-  BLEService* service = bleServer->createService(MESHCORE_SERVICE_UUID);
-
-  meshMessageCharacteristic = service->createCharacteristic(
-    MESHCORE_MESSAGE_CHAR_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
-  );
-
-  meshStatusCharacteristic = service->createCharacteristic(
-    MESHCORE_STATUS_CHAR_UUID,
-    BLECharacteristic::PROPERTY_READ
-  );
-
-  service->start();
-  bleServer->getAdvertising()->addServiceUUID(MESHCORE_SERVICE_UUID);
-  bleServer->getAdvertising()->start();
-  updateMeshCoreStatusCharacteristic();
-  Serial.println("BLE advertising started for MeshCore endpoint");
-}
-
-void updateMeshCoreStatusCharacteristic() {
-  if (!meshStatusCharacteristic) {
-    return;
-  }
-
-  JsonDocument doc;
-  doc["connected"] = meshDeviceConnected;
-  String payload;
-  serializeJson(doc, payload);
-  meshStatusCharacteristic->setValue(payload.c_str());
+  connectToMeshCore();
 }
 
 bool ensureAuthenticated(AsyncWebServerRequest* request) {
@@ -256,6 +237,131 @@ void initFileSystem() {
   Serial.println("LittleFS mounted successfully after format");
 }
 
+bool connectToMeshCore() {
+  lastMeshConnectAttempt = millis();
+  meshDeviceConnected = false;
+  meshMessageCharacteristic = nullptr;
+  meshChannelReady = false;
+
+  Serial.printf("Scanning for MeshCore peer named '%s'...\n", BLE_PEER_NAME);
+
+  BLEScan* scan = BLEDevice::getScan();
+  scan->setActiveScan(true);
+  BLEScanResults results = scan->start(5, false);
+
+  for (int i = 0; i < results.getCount(); i++) {
+    BLEAdvertisedDevice device = results.getDevice(i);
+    if (device.getName() != BLE_PEER_NAME) {
+      continue;
+    }
+
+    Serial.println("MeshCore peer found, attempting connection...");
+
+    if (meshClient == nullptr) {
+      meshClient = BLEDevice::createClient();
+      meshClient->setClientCallbacks(new MeshClientCallbacks());
+    }
+
+    if (!meshClient->connect(&device)) {
+      lastMeshError = "Connection attempt failed";
+      continue;
+    }
+
+    BLERemoteService* service = meshClient->getService(MESHCORE_SERVICE_UUID);
+    if (service == nullptr) {
+      lastMeshError = "MeshCore service not found on peer";
+      meshClient->disconnect();
+      continue;
+    }
+
+    BLERemoteCharacteristic* characteristic = service->getCharacteristic(MESHCORE_MESSAGE_CHAR_UUID);
+    if (characteristic == nullptr) {
+      lastMeshError = "MeshCore message characteristic missing";
+      meshClient->disconnect();
+      continue;
+    }
+
+    if (!characteristic->canWrite()) {
+      lastMeshError = "MeshCore message characteristic is not writable";
+      meshClient->disconnect();
+      continue;
+    }
+
+    meshMessageCharacteristic = characteristic;
+    meshDeviceConnected = true;
+    lastMeshError = "";
+    Serial.println("Connected to MeshCore peer and ready to send messages");
+    if (!ensureMeshChannel()) {
+      meshClient->disconnect();
+      meshDeviceConnected = false;
+      return false;
+    }
+
+    return true;
+  }
+
+  lastMeshError = "MeshCore peer not found during scan";
+  return false;
+}
+
+void maintainMeshCoreLink() {
+  unsigned long now = millis();
+  if (meshDeviceConnected && meshClient != nullptr && meshClient->isConnected()) {
+    return;
+  }
+
+  if (now - lastMeshConnectAttempt < 10000) {
+    return;
+  }
+
+  connectToMeshCore();
+}
+
+bool ensureMeshChannel() {
+  if (meshChannelReady) {
+    return true;
+  }
+
+  if (!meshDeviceConnected || meshMessageCharacteristic == nullptr) {
+    return false;
+  }
+
+  if (!provisionMeshChannel()) {
+    lastMeshError = "Mesh channel provisioning failed";
+    return false;
+  }
+
+  meshChannelReady = true;
+  return true;
+}
+
+bool provisionMeshChannel() {
+  if (strlen(BLE_MESH_CHANNEL_NAME) == 0) {
+    lastMeshError = "Mesh channel name missing";
+    return false;
+  }
+
+  JsonDocument doc;
+  doc["action"] = "ensure_channel";
+  doc["channel"] = BLE_MESH_CHANNEL_NAME;
+  doc["key"] = BLE_MESH_CHANNEL_KEY;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  Serial.printf("Provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
+  try {
+    meshMessageCharacteristic->writeValue(payload.c_str(), payload.length(), false);
+  } catch (...) {
+    lastMeshError = "Failed to provision MeshCore channel";
+    return false;
+  }
+
+  lastMeshError = "";
+
+  return true;
+}
+
 void initWebServer() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -268,7 +374,11 @@ void initWebServer() {
   server.on("/api/mesh/status", HTTP_GET, [](AsyncWebServerRequest *request) {
     JsonDocument doc;
     doc["connected"] = meshDeviceConnected;
+    doc["peerName"] = BLE_PEER_NAME;
     doc["deviceName"] = BLE_DEVICE_NAME;
+    doc["channel"] = BLE_MESH_CHANNEL_NAME;
+    doc["channelReady"] = meshChannelReady;
+    doc["lastError"] = lastMeshError;
 
     String response;
     serializeJson(doc, response);
@@ -281,8 +391,13 @@ void initWebServer() {
         return;
       }
 
-      if (!meshDeviceConnected || meshMessageCharacteristic == nullptr) {
+      if ((!meshDeviceConnected || meshMessageCharacteristic == nullptr) && !connectToMeshCore()) {
         request->send(503, "application/json", "{\"error\":\"MeshCore device not connected\"}");
+        return;
+      }
+
+      if (!ensureMeshChannel()) {
+        request->send(503, "application/json", "{\"error\":\"MeshCore channel unavailable\"}");
         return;
       }
 
@@ -874,19 +989,26 @@ void sendDiscordNotification(const String& title, const String& message) {
 }
 
 void sendMeshCoreNotification(const String& title, const String& message) {
-  if (!meshDeviceConnected || meshMessageCharacteristic == nullptr) {
+  if ((!meshDeviceConnected || meshMessageCharacteristic == nullptr) && !connectToMeshCore()) {
+    Serial.println("MeshCore notification skipped: not connected");
+    return;
+  }
+
+  if (!ensureMeshChannel()) {
+    Serial.println("MeshCore notification skipped: channel not ready");
     return;
   }
 
   JsonDocument doc;
+  doc["channel"] = BLE_MESH_CHANNEL_NAME;
+  doc["key"] = BLE_MESH_CHANNEL_KEY;
   doc["title"] = title;
   doc["body"] = message;
 
   String payload;
   serializeJson(doc, payload);
 
-  meshMessageCharacteristic->setValue(payload.c_str());
-  meshMessageCharacteristic->notify();
+  meshMessageCharacteristic->writeValue(payload.c_str(), payload.length(), false);
 }
 
 String base64Encode(const String& input) {

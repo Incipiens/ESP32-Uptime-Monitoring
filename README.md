@@ -64,6 +64,46 @@ const char* WEB_AUTH_USERNAME = "admin";
 const char* WEB_AUTH_PASSWORD = "strong-password";
 ```
 
+### Pairing with MeshCore over BLE
+
+The firmware now acts as a BLE **client** that connects to the Heltec T114 (MeshCore) using its advertised name and pairing PIN, then writes alert messages to the MeshCore inbox characteristic.
+
+1. **Set the MeshCore peer name, PIN, and channel**
+   - Edit `src/config.cpp` or provide build flags so the ESP32 knows how to reach the T114:
+     ```cpp
+     const char* BLE_PEER_NAME = "Heltec-T114";   // the T114's advertised name
+     const uint32_t BLE_PAIRING_PIN = 123456;      // the MeshCore pairing PIN
+     const char* BLE_MESH_CHANNEL_NAME = "alerts"; // channel to create/use on the T114
+     const char* BLE_MESH_CHANNEL_KEY = "changeme"; // encryption key provisioned with the channel
+     // Optional: local name shown by the ESP32 itself
+     const char* BLE_DEVICE_NAME = "ESP32-Uptime";
+     ```
+     ```ini
+     ; platformio.ini
+     -DBLE_PEER_NAME_VALUE=\"Heltec-T114\"
+     -DBLE_PAIRING_PIN_VALUE=123456
+     -DBLE_MESH_CHANNEL_NAME_VALUE=\"alerts\"
+     -DBLE_MESH_CHANNEL_KEY_VALUE=\"changeme\"
+     -DBLE_DEVICE_NAME_VALUE=\"MyMeshBridge\"
+     ```
+
+2. **Flash the firmware and watch the serial monitor**
+   - On boot the ESP32 scans for the MeshCore name. Logs will show `MeshCore peer found, attempting connection...` and `Connected to MeshCore peer...` once the link is up. If the peer is missing or the PIN is wrong, the error message appears in `/api/mesh/status`.
+
+3. **Allow the ESP32 to initiate the connection**
+   - Put the T114/MeshCore radio in pairing mode so it advertises with the configured name and accepts the PIN above. The ESP32 will pair, bond, and stay connected; the T114 does **not** subscribe to the ESP32.
+
+4. **Triggering alerts to MeshCore**
+   - The ESP32 acts as a client: it scans for the T114, pairs, **ensures the configured channel exists (creating it with the encryption key if missing)**, and then writes alerts into that channel over the MeshCore characteristic `0b5ad4e1-a62f-41a8-99a1-86a9b8b43964`.
+   - You can also send ad-hoc messages via the web API (the ESP32 will connect first if needed):
+     ```bash
+     curl -X POST http://<device-ip>/api/mesh/send \
+       -u "<user>:<pass>" \
+       -H "Content-Type: application/json" \
+       -d '{"title":"Test","message":"Hello Mesh"}'
+     ```
+     Replace `<user>`/`<pass>` with your Basic Auth credentials (if enabled) and `<device-ip>` with the ESP32 IP address. The endpoint returns an error if the T114 cannot be found or paired.
+
 ### Enabling ntfy notifications
 
 Set an ntfy topic to receive alerts whenever a monitored service goes offline. Optional bearer or basic authentication is also supported for secured ntfy servers.

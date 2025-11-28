@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cstdint>
+
 // Wi-Fi credentials
 extern const char* WIFI_SSID;
 extern const char* WIFI_PASSWORD;
@@ -10,6 +12,10 @@ extern const char* WEB_AUTH_PASSWORD;
 
 // BLE configuration
 extern const char* BLE_DEVICE_NAME;
+extern const char* BLE_PEER_NAME;
+extern const uint32_t BLE_PAIRING_PIN;
+extern const char* BLE_MESH_CHANNEL_NAME;
+extern const char* BLE_MESH_CHANNEL_KEY;
 
 // ntfy configuration
 extern const char* NTFY_SERVER;
