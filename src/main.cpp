@@ -266,19 +266,66 @@ bool connectToMeshCore() {
   meshMessageCharacteristic = nullptr;
   meshChannelReady = false;
 
-  Serial.printf("Scanning for MeshCore peer named '%s'...\n", BLE_PEER_NAME);
+  Serial.printf("Scanning for MeshCore peer named '%s' (extended debug)...\n", BLE_PEER_NAME);
 
   BLEScan* scan = BLEDevice::getScan();
   scan->setActiveScan(true);
-  BLEScanResults results = scan->start(5, false);
+
+  // Increase scan duration slightly while debugging
+  const int scanSeconds = 10;
+  BLEScanResults results = scan->start(scanSeconds, false);
+
+  Serial.printf("Scan complete: %d devices found\n", results.getCount());
 
   for (int i = 0; i < results.getCount(); i++) {
     BLEAdvertisedDevice device = results.getDevice(i);
-    if (device.getName() != BLE_PEER_NAME) {
+
+    // Debug: print what we saw for each advertiser
+    String devName = device.getName().c_str();
+    String devAddr = device.getAddress().toString().c_str();
+    int rssi = device.getRSSI();
+    Serial.printf("  [%d] Name='%s' Addr=%s RSSI=%d\n", i, devName.c_str(), devAddr.c_str(), rssi);
+
+    // Print any advertised service UUIDs (if present)
+    std::string svc = device.getServiceUUID().toString();
+    if (svc.length()) {
+      Serial.printf("       Advertised service UUID: %s\n", svc.c_str());
+    } else {
+      // If getServiceUUID unavailable/empty, try listing advertised service UUIDs
+      Serial.print("       No single service UUID string, checking advertised UUIDs...\n");
+      std::vector<BLEUUID> uuids = device.getAdvertisedServiceUUIDs();
+      for (auto &u : uuids) {
+        Serial.printf("         - %s\n", u.toString().c_str());
+      }
+    }
+
+    // Improved matching logic:
+    // - If advertised name exactly equals configured name
+    // - Or the advertised name contains the configured name as substring (case-sensitive)
+    // - Or the device advertises the MeshCore service UUID
+    bool nameMatches = (devName.length() && devName == String(BLE_PEER_NAME));
+    bool nameContains = (devName.length() && devName.indexOf(String(BLE_PEER_NAME)) >= 0);
+    bool serviceMatches = false;
+    // MESHCORE_SERVICE_UUID is defined elsewhere in the file; use haveServiceUUID if available
+    if (device.haveServiceUUID()) {
+      serviceMatches = device.haveServiceUUID(MESHCORE_SERVICE_UUID);
+    } else {
+      // fallback: check advertised UUID list
+      std::vector<BLEUUID> uuids = device.getAdvertisedServiceUUIDs();
+      for (auto &u : uuids) {
+        if (u.equals(BLEUUID(MESHCORE_SERVICE_UUID))) {
+          serviceMatches = true;
+          break;
+        }
+      }
+    }
+
+    if (!(nameMatches || nameContains || serviceMatches)) {
+      Serial.println("       Not the MeshCore peer (name/service mismatch), skipping.");
       continue;
     }
 
-    Serial.println("MeshCore peer found, attempting connection...");
+    Serial.println("MeshCore peer candidate found, attempting connection...");
 
     if (meshClient == nullptr) {
       meshClient = BLEDevice::createClient();
@@ -287,15 +334,14 @@ bool connectToMeshCore() {
 
     if (!meshClient->connect(&device)) {
       lastMeshError = "Connection attempt failed";
+      Serial.println("Connection attempt failed");
       continue;
     }
 
     // Allow MTU negotiation to complete before accessing services
-    // This prevents GATT_BUSY errors (GATTC_ConfigureMTU GATT_BUSY)
     delay(BLE_MTU_NEGOTIATION_DELAY_MS);
 
-    // Retry service discovery to handle cases where MTU negotiation
-    // may still be completing (causes GATT_BUSY errors)
+    // Retry service discovery to handle cases where MTU negotiation may still be completing
     BLERemoteService* service = nullptr;
     for (int retry = 0; retry < BLE_SERVICE_DISCOVERY_RETRIES; retry++) {
       service = meshClient->getService(MESHCORE_SERVICE_UUID);
@@ -309,6 +355,7 @@ bool connectToMeshCore() {
     }
     if (service == nullptr) {
       lastMeshError = "MeshCore service not found on peer";
+      Serial.println("MeshCore service not found on peer, disconnecting...");
       meshClient->disconnect();
       continue;
     }
@@ -316,12 +363,14 @@ bool connectToMeshCore() {
     BLERemoteCharacteristic* characteristic = service->getCharacteristic(MESHCORE_MESSAGE_CHAR_UUID);
     if (characteristic == nullptr) {
       lastMeshError = "MeshCore message characteristic missing";
+      Serial.println("MeshCore message characteristic missing, disconnecting...");
       meshClient->disconnect();
       continue;
     }
 
     if (!characteristic->canWrite()) {
       lastMeshError = "MeshCore message characteristic is not writable";
+      Serial.println("MeshCore message characteristic is not writable, disconnecting...");
       meshClient->disconnect();
       continue;
     }
@@ -330,7 +379,9 @@ bool connectToMeshCore() {
     meshDeviceConnected = true;
     lastMeshError = "";
     Serial.println("Connected to MeshCore peer and ready to send messages");
+
     if (!ensureMeshChannel()) {
+      Serial.println("ensureMeshChannel() failed, disconnecting...");
       meshClient->disconnect();
       meshDeviceConnected = false;
       return false;
@@ -340,6 +391,7 @@ bool connectToMeshCore() {
   }
 
   lastMeshError = "MeshCore peer not found during scan";
+  Serial.println(lastMeshError.c_str());
   return false;
 }
 
