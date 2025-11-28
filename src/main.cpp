@@ -55,6 +55,7 @@ const int BLE_SERVICE_DISCOVERY_RETRIES = 5;
 const int BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS = 1000;
 const int BLE_DEINIT_CLEANUP_DELAY_MS = 100; // Allow BLE stack to complete cleanup before deinit
 const int BLE_CLIENT_CLEANUP_DELAY_MS = 100; // Allow BLE stack to complete cleanup when recreating client
+const int BLE_NOTIFY_REGISTRATION_DELAY_MS = 500; // Allow CCCD write to complete after registering for notifications
 
 // BLE/WiFi coexistence - ESP32-S3 cannot run WiFi and BLE simultaneously
 bool bleOperationInProgress = false;
@@ -710,6 +711,9 @@ bool connectToMeshCore() {
 
     // Register for notifications
     rxChar->registerForNotify(meshNotifyCallback);
+    
+    // Wait for notification subscription to be established (CCCD write to complete)
+    delay(BLE_NOTIFY_REGISTRATION_DELAY_MS);
     
     meshTxCharacteristic = txChar;
     meshRxCharacteristic = rxChar;
