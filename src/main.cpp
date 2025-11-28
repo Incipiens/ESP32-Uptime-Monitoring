@@ -191,7 +191,9 @@ bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
     
     // For BLE, write the raw payload directly - no framing needed
     // The BLE link layer handles frame integrity
-    meshTxCharacteristic->writeValue(const_cast<uint8_t*>(payload), payloadLen, false);
+    // Use Write With Response (true) to ensure the device receives and processes the command
+    // Write Without Response (false) can be unreliable for protocol commands that expect replies
+    meshTxCharacteristic->writeValue(const_cast<uint8_t*>(payload), payloadLen, true);
     success = true;
   } catch (...) {
     Serial.println("MeshCore TX failed: write error");
