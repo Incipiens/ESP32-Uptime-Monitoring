@@ -51,10 +51,12 @@ bool meshChannelReady = false;
 const int BLE_MTU_NEGOTIATION_DELAY_MS = 1500;
 const int BLE_SERVICE_DISCOVERY_RETRIES = 3;
 const int BLE_SERVICE_DISCOVERY_RETRY_DELAY_MS = 500;
+const int BLE_DEINIT_CLEANUP_DELAY_MS = 100; // Allow BLE stack to complete cleanup before deinit
 
 // BLE/WiFi coexistence - ESP32-S3 cannot run WiFi and BLE simultaneously
 bool bleOperationInProgress = false;
 bool monitoringPaused = false;
+bool bleInitialized = false;
 
 // UUIDs derived from random generator to avoid collisions
 const char* MESHCORE_SERVICE_UUID = "8b9b0b3d-1e1d-4e91-9c23-4c1e1a4f0a2d";
@@ -200,6 +202,13 @@ void initWiFi() {
 void initBLE() {
   Serial.println("Initializing BLE MeshCore client...");
   BLEDevice::init(BLE_DEVICE_NAME);
+  
+  // Verify initialization succeeded before continuing
+  if (!BLEDevice::getInitialized()) {
+    Serial.println("BLE initialization failed");
+    return;
+  }
+  bleInitialized = true;
 
   // Set up PIN-based pairing to satisfy MeshCore's security expectations
   BLESecurity* security = new BLESecurity();
@@ -335,17 +344,28 @@ bool connectToMeshCore() {
 }
 
 void disconnectFromMeshCore() {
-  if (meshClient != nullptr && meshClient->isConnected()) {
-    Serial.println("Disconnecting from MeshCore...");
-    meshClient->disconnect();
+  // Clean up the BLE client properly before deinit
+  if (meshClient != nullptr) {
+    if (meshClient->isConnected()) {
+      Serial.println("Disconnecting from MeshCore...");
+      meshClient->disconnect();
+    }
+    // Delete the client to properly deregister it from BLE stack
+    delete meshClient;
+    meshClient = nullptr;
   }
+  
   meshDeviceConnected = false;
   meshMessageCharacteristic = nullptr;
   meshChannelReady = false;
   
-  // Deinitialize BLE to free resources for WiFi
-  BLEDevice::deinit();
-  Serial.println("BLE deinitialized");
+  // Only deinitialize BLE if it was initialized
+  if (bleInitialized) {
+    delay(BLE_DEINIT_CLEANUP_DELAY_MS);
+    BLEDevice::deinit();
+    bleInitialized = false;
+    Serial.println("BLE deinitialized");
+  }
 }
 
 void disconnectWiFi() {
