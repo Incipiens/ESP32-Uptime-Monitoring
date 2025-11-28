@@ -44,7 +44,8 @@ AsyncWebServer server(80);
 
 // BLE / MeshCore
 BLEClient* meshClient = nullptr;
-BLERemoteCharacteristic* meshMessageCharacteristic = nullptr;
+BLERemoteCharacteristic* meshTxCharacteristic = nullptr;  // ESP32 writes to this (TX to device)
+BLERemoteCharacteristic* meshRxCharacteristic = nullptr;  // ESP32 reads from this (RX from device)
 bool meshDeviceConnected = false;
 unsigned long lastMeshConnectAttempt = 0;
 String lastMeshError = "";
@@ -60,10 +61,49 @@ bool bleOperationInProgress = false;
 bool monitoringPaused = false;
 bool bleInitialized = false;
 
-// MeshCore BLE Service UUIDs - used for communication with MeshCore nodes
-const char* MESHCORE_SERVICE_UUID = "0b5ad4e0-a62f-41a8-99a1-86a9b8b43964";
-// Inbox Characteristic - used to write messages to the MeshCore node
-const char* MESHCORE_MESSAGE_CHAR_UUID = "0b5ad4e1-a62f-41a8-99a1-86a9b8b43964";
+// MeshCore protocol state
+enum MeshCoreState {
+  MESH_STATE_DISCONNECTED = 0,
+  MESH_STATE_CONNECTED,
+  MESH_STATE_NEGOTIATED,  // After CMD_DEVICE_QUERY
+  MESH_STATE_READY        // After CMD_APP_START
+};
+MeshCoreState meshProtocolState = MESH_STATE_DISCONNECTED;
+uint8_t meshProtocolVersion = 3;  // Target protocol version
+uint8_t meshChannelIndex = 0;     // Channel index for sending messages
+
+// Nordic UART Service UUIDs (used by MeshCore BLE companion firmware)
+const char* NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
+const char* NUS_TX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // Write to this
+const char* NUS_RX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // Notifications from this
+
+// MeshCore Companion Radio Protocol Commands
+const uint8_t CMD_APP_START = 1;
+const uint8_t CMD_SEND_CHANNEL_TXT_MSG = 3;
+const uint8_t CMD_GET_CHANNEL = 31;
+const uint8_t CMD_SET_CHANNEL = 32;
+const uint8_t CMD_DEVICE_QUERY = 22;
+
+// MeshCore Protocol Response Codes
+const uint8_t RESP_CODE_OK = 0;
+const uint8_t RESP_CODE_ERR = 1;
+const uint8_t RESP_CODE_SELF_INFO = 5;
+const uint8_t RESP_CODE_DEVICE_INFO = 13;
+const uint8_t RESP_CODE_CHANNEL_INFO = 18;
+
+// MeshCore Protocol Error Codes
+const uint8_t ERR_CODE_NOT_FOUND = 2;
+
+// MeshCore Frame markers
+const uint8_t FRAME_OUT_MARKER = '<';  // 0x3C - outgoing frames from client
+const uint8_t FRAME_IN_MARKER = '>';   // 0x3E - incoming frames from device
+
+// RX buffer for accumulating BLE notifications
+const int MESH_RX_BUFFER_SIZE = 256;
+uint8_t meshRxBuffer[MESH_RX_BUFFER_SIZE];
+int meshRxBufferPos = 0;
+volatile bool meshResponseReceived = false;
+uint8_t meshLastResponseCode = 0xFF;
 
 class MeshClientCallbacks : public BLEClientCallbacks {
   void onConnect(BLEClient* client) override {
@@ -74,11 +114,100 @@ class MeshClientCallbacks : public BLEClientCallbacks {
   void onDisconnect(BLEClient* client) override {
     meshDeviceConnected = false;
     meshChannelReady = false;
+    meshProtocolState = MESH_STATE_DISCONNECTED;
   }
 };
 
 // Static callback instance to avoid memory leak from repeated allocations
 static MeshClientCallbacks meshClientCallbacks;
+
+// Notification callback for receiving data from MeshCore device
+void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+  // Accumulate data in the RX buffer
+  for (size_t i = 0; i < length && meshRxBufferPos < MESH_RX_BUFFER_SIZE; i++) {
+    meshRxBuffer[meshRxBufferPos++] = pData[i];
+  }
+  
+  // Check if we have a complete frame (marker + 2-byte length + payload)
+  // Frame format: '>' (0x3E) + len_lo + len_hi + payload
+  while (meshRxBufferPos >= 3) {
+    // Look for frame marker
+    if (meshRxBuffer[0] != FRAME_IN_MARKER) {
+      // Discard junk data until we find a marker
+      int shift = 1;
+      while (shift < meshRxBufferPos && meshRxBuffer[shift] != FRAME_IN_MARKER) {
+        shift++;
+      }
+      // Shift buffer
+      memmove(meshRxBuffer, meshRxBuffer + shift, meshRxBufferPos - shift);
+      meshRxBufferPos -= shift;
+      continue;
+    }
+    
+    // We have a frame marker, check if we have the length
+    if (meshRxBufferPos < 3) break;
+    
+    uint16_t frameLen = meshRxBuffer[1] | (meshRxBuffer[2] << 8);
+    uint16_t totalLen = 3 + frameLen;
+    
+    if (meshRxBufferPos < totalLen) break;  // Need more data
+    
+    // We have a complete frame
+    if (frameLen > 0) {
+      meshLastResponseCode = meshRxBuffer[3];  // First byte of payload is response code
+      Serial.printf("MeshCore RX: response code 0x%02X, frame length %d\n", meshLastResponseCode, frameLen);
+    }
+    meshResponseReceived = true;
+    
+    // Shift buffer past this frame
+    if (meshRxBufferPos > totalLen) {
+      memmove(meshRxBuffer, meshRxBuffer + totalLen, meshRxBufferPos - totalLen);
+    }
+    meshRxBufferPos -= totalLen;
+    break;  // Process one frame at a time
+  }
+}
+
+// Send a frame to the MeshCore device using the Companion Radio Protocol framing
+bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
+  if (!meshDeviceConnected || meshTxCharacteristic == nullptr) {
+    return false;
+  }
+  
+  // Build frame: '<' + len_lo + len_hi + payload
+  size_t frameLen = 3 + payloadLen;
+  uint8_t* frame = new uint8_t[frameLen];
+  frame[0] = FRAME_OUT_MARKER;
+  frame[1] = payloadLen & 0xFF;
+  frame[2] = (payloadLen >> 8) & 0xFF;
+  memcpy(frame + 3, payload, payloadLen);
+  
+  Serial.printf("MeshCore TX: cmd 0x%02X, payload length %d\n", payload[0], payloadLen);
+  
+  bool success = false;
+  try {
+    // Reset response state before sending
+    meshResponseReceived = false;
+    meshLastResponseCode = 0xFF;
+    
+    meshTxCharacteristic->writeValue(frame, frameLen, false);
+    success = true;
+  } catch (...) {
+    Serial.println("MeshCore TX failed: write error");
+  }
+  
+  delete[] frame;
+  return success;
+}
+
+// Wait for a response from the MeshCore device
+bool waitForMeshResponse(unsigned long timeoutMs = 5000) {
+  unsigned long start = millis();
+  while (!meshResponseReceived && (millis() - start) < timeoutMs) {
+    delay(10);
+  }
+  return meshResponseReceived;
+}
 
 // Service types
 // Right now the behavior for each is rudimentary
@@ -357,8 +486,11 @@ void initFileSystem() {
 bool connectToMeshCore() {
   lastMeshConnectAttempt = millis();
   meshDeviceConnected = false;
-  meshMessageCharacteristic = nullptr;
+  meshTxCharacteristic = nullptr;
+  meshRxCharacteristic = nullptr;
   meshChannelReady = false;
+  meshProtocolState = MESH_STATE_DISCONNECTED;
+  meshRxBufferPos = 0;
 
   Serial.printf("Scanning for MeshCore peer named '%s' (extended debug)...\n", BLE_PEER_NAME);
 
@@ -394,15 +526,15 @@ bool connectToMeshCore() {
       Serial.println("       No single advertised service UUID available");
     }
 
-    // Matching logic: exact name, substring, or advertised service UUID match
+    // Matching logic: exact name, substring, or advertised Nordic UART service UUID match
     bool nameMatches = (devName.length() && devName == String(BLE_PEER_NAME));
     bool nameContains = (devName.length() && devName.indexOf(String(BLE_PEER_NAME)) >= 0);
     bool serviceMatches = false;
 
     if (device.haveServiceUUID()) {
       BLEUUID adv = device.getServiceUUID();
-      // Compare to configured MeshCore UUID (safe regardless of how MESHCORE_SERVICE_UUID is defined)
-      serviceMatches = adv.equals(BLEUUID(MESHCORE_SERVICE_UUID));
+      // Compare to Nordic UART Service UUID
+      serviceMatches = adv.equals(BLEUUID(NUS_SERVICE_UUID));
     }
 
     if (!(nameMatches || nameContains || serviceMatches)) {
@@ -442,9 +574,10 @@ bool connectToMeshCore() {
     delay(BLE_MTU_NEGOTIATION_DELAY_MS);
 
     // Retry service discovery to handle cases where MTU negotiation may still be completing
+    // Try Nordic UART Service (NUS) - used by MeshCore BLE companion firmware
     BLERemoteService* service = nullptr;
     for (int retry = 0; retry < BLE_SERVICE_DISCOVERY_RETRIES; retry++) {
-      service = meshClient->getService(MESHCORE_SERVICE_UUID);
+      service = meshClient->getService(NUS_SERVICE_UUID);
       if (service != nullptr) {
         break;
       }
@@ -454,36 +587,60 @@ bool connectToMeshCore() {
       }
     }
     if (service == nullptr) {
-      lastMeshError = "MeshCore service not found on peer";
-      Serial.println("MeshCore service not found on peer, disconnecting...");
+      lastMeshError = "Nordic UART Service not found on peer";
+      Serial.println("Nordic UART Service not found on peer, disconnecting...");
       meshClient->disconnect();
       continue;
     }
 
-    BLERemoteCharacteristic* characteristic = service->getCharacteristic(MESHCORE_MESSAGE_CHAR_UUID);
-    if (characteristic == nullptr) {
-      lastMeshError = "MeshCore message characteristic missing";
-      Serial.println("MeshCore message characteristic missing, disconnecting...");
+    // Get TX characteristic (ESP32 writes to this)
+    BLERemoteCharacteristic* txChar = service->getCharacteristic(NUS_TX_CHAR_UUID);
+    if (txChar == nullptr) {
+      lastMeshError = "NUS TX characteristic missing";
+      Serial.println("NUS TX characteristic missing, disconnecting...");
       meshClient->disconnect();
       continue;
     }
 
-    if (!characteristic->canWrite()) {
-      lastMeshError = "MeshCore message characteristic is not writable";
-      Serial.println("MeshCore message characteristic is not writable, disconnecting...");
+    if (!txChar->canWrite()) {
+      lastMeshError = "NUS TX characteristic is not writable";
+      Serial.println("NUS TX characteristic is not writable, disconnecting...");
       meshClient->disconnect();
       continue;
     }
 
-    meshMessageCharacteristic = characteristic;
+    // Get RX characteristic (ESP32 receives notifications from this)
+    BLERemoteCharacteristic* rxChar = service->getCharacteristic(NUS_RX_CHAR_UUID);
+    if (rxChar == nullptr) {
+      lastMeshError = "NUS RX characteristic missing";
+      Serial.println("NUS RX characteristic missing, disconnecting...");
+      meshClient->disconnect();
+      continue;
+    }
+
+    if (!rxChar->canNotify()) {
+      lastMeshError = "NUS RX characteristic cannot notify";
+      Serial.println("NUS RX characteristic cannot notify, disconnecting...");
+      meshClient->disconnect();
+      continue;
+    }
+
+    // Register for notifications
+    rxChar->registerForNotify(meshNotifyCallback);
+    
+    meshTxCharacteristic = txChar;
+    meshRxCharacteristic = rxChar;
     meshDeviceConnected = true;
+    meshProtocolState = MESH_STATE_CONNECTED;
     lastMeshError = "";
-    Serial.println("Connected to MeshCore peer and ready to send messages");
+    Serial.println("Connected to MeshCore peer via Nordic UART Service");
 
+    // Perform MeshCore protocol handshake
     if (!ensureMeshChannel()) {
       Serial.println("ensureMeshChannel() failed, disconnecting...");
       meshClient->disconnect();
       meshDeviceConnected = false;
+      meshProtocolState = MESH_STATE_DISCONNECTED;
       return false;
     }
 
@@ -510,8 +667,11 @@ void disconnectFromMeshCore() {
   }
   
   meshDeviceConnected = false;
-  meshMessageCharacteristic = nullptr;
+  meshTxCharacteristic = nullptr;
+  meshRxCharacteristic = nullptr;
   meshChannelReady = false;
+  meshProtocolState = MESH_STATE_DISCONNECTED;
+  meshRxBufferPos = 0;
   
   // Only deinitialize BLE if it was initialized
   if (bleInitialized) {
@@ -552,14 +712,75 @@ void reconnectWiFi() {
 }
 
 bool ensureMeshChannel() {
-  if (meshChannelReady) {
+  if (meshChannelReady && meshProtocolState == MESH_STATE_READY) {
     return true;
   }
 
-  if (!meshDeviceConnected || meshMessageCharacteristic == nullptr) {
+  if (!meshDeviceConnected || meshTxCharacteristic == nullptr) {
     return false;
   }
 
+  // Step 1: Send CMD_DEVICE_QUERY to negotiate protocol version
+  if (meshProtocolState < MESH_STATE_NEGOTIATED) {
+    Serial.println("Sending CMD_DEVICE_QUERY...");
+    uint8_t queryCmd[2] = { CMD_DEVICE_QUERY, meshProtocolVersion };
+    if (!sendMeshFrame(queryCmd, sizeof(queryCmd))) {
+      lastMeshError = "Failed to send CMD_DEVICE_QUERY";
+      return false;
+    }
+    
+    if (!waitForMeshResponse(5000)) {
+      lastMeshError = "Timeout waiting for RESP_CODE_DEVICE_INFO";
+      return false;
+    }
+    
+    if (meshLastResponseCode != RESP_CODE_DEVICE_INFO) {
+      lastMeshError = "Unexpected response to CMD_DEVICE_QUERY";
+      Serial.printf("Expected RESP_CODE_DEVICE_INFO (0x%02X), got 0x%02X\n", RESP_CODE_DEVICE_INFO, meshLastResponseCode);
+      return false;
+    }
+    
+    meshProtocolState = MESH_STATE_NEGOTIATED;
+    Serial.println("Protocol negotiated successfully");
+  }
+
+  // Step 2: Send CMD_APP_START to start the application session
+  if (meshProtocolState < MESH_STATE_READY) {
+    Serial.println("Sending CMD_APP_START...");
+    // CMD_APP_START payload: version (1), reserved (6), app_name (variable)
+    const char* appName = "ESP32-Uptime";
+    size_t appNameLen = strlen(appName);
+    size_t cmdLen = 1 + 1 + 6 + appNameLen;
+    uint8_t* startCmd = new uint8_t[cmdLen];
+    startCmd[0] = CMD_APP_START;
+    startCmd[1] = meshProtocolVersion;  // version
+    memset(startCmd + 2, 0, 6);  // reserved bytes
+    memcpy(startCmd + 8, appName, appNameLen);
+    
+    bool sent = sendMeshFrame(startCmd, cmdLen);
+    delete[] startCmd;
+    
+    if (!sent) {
+      lastMeshError = "Failed to send CMD_APP_START";
+      return false;
+    }
+    
+    if (!waitForMeshResponse(5000)) {
+      lastMeshError = "Timeout waiting for RESP_CODE_SELF_INFO";
+      return false;
+    }
+    
+    if (meshLastResponseCode != RESP_CODE_SELF_INFO) {
+      lastMeshError = "Unexpected response to CMD_APP_START";
+      Serial.printf("Expected RESP_CODE_SELF_INFO (0x%02X), got 0x%02X\n", RESP_CODE_SELF_INFO, meshLastResponseCode);
+      return false;
+    }
+    
+    meshProtocolState = MESH_STATE_READY;
+    Serial.println("Application session started successfully");
+  }
+
+  // Step 3: Provision the channel if needed
   if (!provisionMeshChannel()) {
     lastMeshError = "Mesh channel provisioning failed";
     return false;
@@ -575,28 +796,64 @@ bool provisionMeshChannel() {
     return false;
   }
 
-  JsonDocument doc;
-  doc["action"] = "ensure_channel";
-  doc["channel"] = BLE_MESH_CHANNEL_NAME;
-  doc["key"] = BLE_MESH_CHANNEL_KEY;
-
-  String payload;
-  serializeJson(doc, payload);
-
-  Serial.printf("Provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
-  try {
-    meshMessageCharacteristic->writeValue(
-      const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
-      payload.length(),
-      false
-    );
-  } catch (...) {
-    lastMeshError = "Failed to provision MeshCore channel";
+  Serial.printf("Checking/provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
+  
+  // First try to get the channel at index 0 to see if it exists
+  uint8_t getChannelCmd[2] = { CMD_GET_CHANNEL, meshChannelIndex };
+  if (!sendMeshFrame(getChannelCmd, sizeof(getChannelCmd))) {
+    lastMeshError = "Failed to send CMD_GET_CHANNEL";
     return false;
   }
-
+  
+  if (!waitForMeshResponse(3000)) {
+    Serial.println("No response to CMD_GET_CHANNEL, will try to set channel");
+  } else if (meshLastResponseCode == RESP_CODE_CHANNEL_INFO) {
+    // Channel exists, we can use it
+    Serial.println("Channel already exists, ready to use");
+    return true;
+  }
+  
+  // Channel doesn't exist or error, try to create/set it
+  // CMD_SET_CHANNEL payload: channel_index (1), name (32 bytes null-padded), key (16 bytes)
+  Serial.printf("Setting channel at index %d...\n", meshChannelIndex);
+  
+  uint8_t setChannelCmd[1 + 1 + 32 + 16];
+  memset(setChannelCmd, 0, sizeof(setChannelCmd));
+  setChannelCmd[0] = CMD_SET_CHANNEL;
+  setChannelCmd[1] = meshChannelIndex;
+  
+  // Copy channel name (up to 32 bytes, null-padded)
+  size_t nameLen = strlen(BLE_MESH_CHANNEL_NAME);
+  if (nameLen > 32) nameLen = 32;
+  memcpy(setChannelCmd + 2, BLE_MESH_CHANNEL_NAME, nameLen);
+  
+  // Copy channel key (up to 16 bytes, null-padded)
+  size_t keyLen = strlen(BLE_MESH_CHANNEL_KEY);
+  if (keyLen > 16) keyLen = 16;
+  memcpy(setChannelCmd + 34, BLE_MESH_CHANNEL_KEY, keyLen);
+  
+  if (!sendMeshFrame(setChannelCmd, sizeof(setChannelCmd))) {
+    lastMeshError = "Failed to send CMD_SET_CHANNEL";
+    return false;
+  }
+  
+  if (!waitForMeshResponse(3000)) {
+    lastMeshError = "Timeout waiting for channel set response";
+    return false;
+  }
+  
+  if (meshLastResponseCode == RESP_CODE_OK) {
+    Serial.println("Channel set successfully");
+    lastMeshError = "";
+    return true;
+  } else if (meshLastResponseCode == RESP_CODE_ERR) {
+    lastMeshError = "Failed to set channel (device error)";
+    return false;
+  }
+  
+  // Any other response - assume it worked
+  Serial.printf("Received response code 0x%02X, assuming success\n", meshLastResponseCode);
   lastMeshError = "";
-
   return true;
 }
 
@@ -616,6 +873,7 @@ void initWebServer() {
     doc["deviceName"] = BLE_DEVICE_NAME;
     doc["channel"] = BLE_MESH_CHANNEL_NAME;
     doc["channelReady"] = meshChannelReady;
+    doc["protocolState"] = (int)meshProtocolState;
     doc["lastError"] = lastMeshError;
     doc["bleOperationInProgress"] = bleOperationInProgress;
     doc["monitoringPaused"] = monitoringPaused;
@@ -1246,27 +1504,53 @@ void sendMeshCoreNotification(const String& title, const String& message) {
   initBLE();
   
   // Try to connect and send message
-  if (meshDeviceConnected && meshMessageCharacteristic != nullptr) {
+  if (meshDeviceConnected && meshTxCharacteristic != nullptr) {
     if (ensureMeshChannel()) {
-      JsonDocument doc;
-      doc["channel"] = BLE_MESH_CHANNEL_NAME;
-      doc["key"] = BLE_MESH_CHANNEL_KEY;
-      doc["title"] = title;
-      doc["body"] = message;
-
-      String payload;
-      serializeJson(doc, payload);
-
-      try {
-        meshMessageCharacteristic->writeValue(
-          const_cast<uint8_t*>(reinterpret_cast<const uint8_t*>(payload.c_str())),
-          payload.length(),
-          false
-        );
-        Serial.println("MeshCore notification sent successfully");
-      } catch (...) {
+      // Build the message: combine title and message
+      String fullMessage = title + ": " + message;
+      
+      // CMD_SEND_CHANNEL_TXT_MSG payload:
+      // txt_type (1 byte) - 0 for plain text
+      // channel_index (1 byte)
+      // timestamp (4 bytes, little-endian, unix seconds)
+      // text (variable, UTF-8)
+      
+      size_t textLen = fullMessage.length();
+      if (textLen > 140) textLen = 140;  // Conservative limit for LoRa payload
+      
+      size_t cmdLen = 1 + 1 + 1 + 4 + textLen;
+      uint8_t* sendCmd = new uint8_t[cmdLen];
+      
+      sendCmd[0] = CMD_SEND_CHANNEL_TXT_MSG;
+      sendCmd[1] = 0;  // txt_type = TXT_TYPE_PLAIN
+      sendCmd[2] = meshChannelIndex;
+      
+      // Timestamp (current unix time, little-endian)
+      uint32_t timestamp = (uint32_t)(millis() / 1000);  // Simple timestamp (could use NTP if available)
+      sendCmd[3] = timestamp & 0xFF;
+      sendCmd[4] = (timestamp >> 8) & 0xFF;
+      sendCmd[5] = (timestamp >> 16) & 0xFF;
+      sendCmd[6] = (timestamp >> 24) & 0xFF;
+      
+      // Copy message text
+      memcpy(sendCmd + 7, fullMessage.c_str(), textLen);
+      
+      if (sendMeshFrame(sendCmd, cmdLen)) {
+        // Wait for send confirmation
+        if (waitForMeshResponse(5000)) {
+          if (meshLastResponseCode == RESP_CODE_OK || meshLastResponseCode == 0x06) {  // RESP_CODE_SENT = 6
+            Serial.println("MeshCore notification sent successfully");
+          } else {
+            Serial.printf("MeshCore notification: unexpected response 0x%02X\n", meshLastResponseCode);
+          }
+        } else {
+          Serial.println("MeshCore notification: no response (may still be sent)");
+        }
+      } else {
         Serial.println("MeshCore notification failed: write error");
       }
+      
+      delete[] sendCmd;
     } else {
       Serial.println("MeshCore notification skipped: channel not ready");
     }
