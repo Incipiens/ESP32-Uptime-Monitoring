@@ -100,15 +100,12 @@ const uint8_t RESP_CODE_CHANNEL_INFO = 18;
 // MeshCore Protocol Error Codes
 const uint8_t ERR_CODE_NOT_FOUND = 2;
 
-// MeshCore Frame markers
-const uint8_t FRAME_OUT_MARKER = '<';  // 0x3C - outgoing frames from client
-const uint8_t FRAME_IN_MARKER = '>';   // 0x3E - incoming frames from device
-
 // Maximum frame payload size (MeshCore limit is 172 bytes, BLE MTU is typically 185-512 after negotiation)
 const uint16_t MAX_FRAME_PAYLOAD = 172;
 
-// Frame header size (marker + 2-byte length)
-const int FRAME_HEADER_SIZE = 3;
+// Note: For BLE, frames are sent/received as raw payloads - no framing markers needed.
+// The USB protocol uses '<' and '>' markers with length prefix, but BLE doesn't need this
+// because each BLE characteristic write/notification is a complete frame.
 
 // MeshCore channel configuration sizes
 const size_t MESH_CHANNEL_NAME_SIZE = 32;
@@ -120,7 +117,7 @@ const size_t APP_START_RESERVED_SIZE = 6;
 // Maximum text message length (conservative for LoRa payload)
 const size_t MAX_TEXT_MESSAGE_LEN = 140;
 
-// RX buffer for accumulating BLE notifications
+// RX buffer for storing received BLE notification payload
 const int MESH_RX_BUFFER_SIZE = 256;
 uint8_t meshRxBuffer[MESH_RX_BUFFER_SIZE];
 int meshRxBufferPos = 0;
@@ -144,71 +141,37 @@ class MeshClientCallbacks : public BLEClientCallbacks {
 static MeshClientCallbacks meshClientCallbacks;
 
 // Notification callback for receiving data from MeshCore device
+// For BLE: each notification is a complete frame (no framing markers needed)
+// The first byte of the payload is the response/push code
 void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-  // Accumulate data in the RX buffer with overflow protection
+  // For BLE, each notification is a complete frame - no accumulation needed
+  // The BLE link layer ensures frame integrity
+  
+  if (length == 0) {
+    Serial.println("MeshCore RX: empty notification received");
+    return;
+  }
+  
+  // First byte is the response code
+  meshLastResponseCode = pData[0];
+  Serial.printf("MeshCore RX: response code 0x%02X, length %d\n", meshLastResponseCode, (int)length);
+  
+  // Store the payload in the buffer for any code that might need to parse additional data
   size_t bytesToCopy = length;
-  size_t availableSpace = MESH_RX_BUFFER_SIZE - meshRxBufferPos;
-  
-  if (bytesToCopy > availableSpace) {
-    Serial.printf("MeshCore RX buffer overflow: dropping %d bytes\n", (int)(bytesToCopy - availableSpace));
-    bytesToCopy = availableSpace;
+  if (bytesToCopy > MESH_RX_BUFFER_SIZE) {
+    Serial.printf("MeshCore RX: payload too large, truncating from %d to %d bytes\n", 
+                  (int)length, MESH_RX_BUFFER_SIZE);
+    bytesToCopy = MESH_RX_BUFFER_SIZE;
   }
+  memcpy(meshRxBuffer, pData, bytesToCopy);
+  meshRxBufferPos = bytesToCopy;
   
-  if (bytesToCopy > 0) {
-    memcpy(meshRxBuffer + meshRxBufferPos, pData, bytesToCopy);
-    meshRxBufferPos += bytesToCopy;
-  }
-  
-  // Check if we have a complete frame (marker + 2-byte length + payload)
-  // Frame format: '>' (0x3E) + len_lo + len_hi + payload
-  while (meshRxBufferPos >= 3) {
-    // Look for frame marker
-    if (meshRxBuffer[0] != FRAME_IN_MARKER) {
-      // Discard junk data until we find a marker
-      int shift = 1;
-      while (shift < meshRxBufferPos && meshRxBuffer[shift] != FRAME_IN_MARKER) {
-        shift++;
-      }
-      // Shift buffer
-      memmove(meshRxBuffer, meshRxBuffer + shift, meshRxBufferPos - shift);
-      meshRxBufferPos -= shift;
-      Serial.printf("MeshCore RX: discarded %d bytes of junk data\n", shift);
-      continue;
-    }
-    
-    // We have a frame marker, check if we have the length
-    if (meshRxBufferPos < 3) break;
-    
-    uint16_t frameLen = meshRxBuffer[1] | (meshRxBuffer[2] << 8);
-    
-    // Validate frame length to prevent overflow
-    if (frameLen > MAX_FRAME_PAYLOAD) {
-      Serial.printf("MeshCore RX: invalid frame length %d, resetting buffer\n", frameLen);
-      meshRxBufferPos = 0;
-      break;
-    }
-    
-    int totalLen = 3 + (int)frameLen;
-    
-    if (meshRxBufferPos < totalLen) break;  // Need more data
-    
-    // We have a complete frame
-    if (frameLen > 0) {
-      meshLastResponseCode = meshRxBuffer[3];  // First byte of payload is response code
-      Serial.printf("MeshCore RX: response code 0x%02X, frame length %d\n", meshLastResponseCode, frameLen);
-    }
-    meshResponseReceived = true;
-    
-    // Shift buffer past this frame
-    if (meshRxBufferPos > totalLen) {
-      memmove(meshRxBuffer, meshRxBuffer + totalLen, meshRxBufferPos - totalLen);
-    }
-    meshRxBufferPos -= totalLen;
-    break;  // Process one frame at a time
-  }
+  meshResponseReceived = true;
 }
 
-// Send a frame to the MeshCore device using the Companion Radio Protocol framing
+// Send a frame to the MeshCore device
+// For BLE: frames are sent as raw payload (no framing needed - BLE handles integrity)
+// For USB: frames would need '<' + len_lo + len_hi + payload framing (not used here)
 bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
   if (!meshDeviceConnected || meshTxCharacteristic == nullptr || meshProtocolState < MESH_STATE_CONNECTED) {
     return false;
@@ -220,29 +183,6 @@ bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
     return false;
   }
   
-  // Build frame: '<' + len_lo + len_hi + payload
-  // Use stack buffer for typical frame sizes to avoid fragmentation
-  // STACK_BUFFER_SIZE = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD + some margin
-  const size_t STACK_BUFFER_SIZE = FRAME_HEADER_SIZE + MAX_FRAME_PAYLOAD + 8;
-  size_t frameLen = FRAME_HEADER_SIZE + payloadLen;
-  
-  uint8_t stackBuffer[STACK_BUFFER_SIZE];
-  uint8_t* frame = stackBuffer;
-  
-  // Only use heap allocation for larger frames
-  if (frameLen > STACK_BUFFER_SIZE) {
-    frame = new uint8_t[frameLen];
-    if (frame == nullptr) {
-      Serial.println("MeshCore TX failed: memory allocation error");
-      return false;
-    }
-  }
-  
-  frame[0] = FRAME_OUT_MARKER;
-  frame[1] = payloadLen & 0xFF;
-  frame[2] = (payloadLen >> 8) & 0xFF;
-  memcpy(frame + FRAME_HEADER_SIZE, payload, payloadLen);
-  
   Serial.printf("MeshCore TX: cmd 0x%02X, payload length %d\n", payload[0], (int)payloadLen);
   
   bool success = false;
@@ -251,15 +191,12 @@ bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
     meshResponseReceived = false;
     meshLastResponseCode = 0xFF;
     
-    meshTxCharacteristic->writeValue(frame, frameLen, false);
+    // For BLE, write the raw payload directly - no framing needed
+    // The BLE link layer handles frame integrity
+    meshTxCharacteristic->writeValue(const_cast<uint8_t*>(payload), payloadLen, false);
     success = true;
   } catch (...) {
     Serial.println("MeshCore TX failed: write error");
-  }
-  
-  // Only delete if we used heap allocation
-  if (frame != stackBuffer) {
-    delete[] frame;
   }
   
   return success;
