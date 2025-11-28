@@ -85,8 +85,6 @@ const char* NUS_RX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // Notif
 // MeshCore Companion Radio Protocol Commands
 const uint8_t CMD_APP_START = 1;
 const uint8_t CMD_SEND_CHANNEL_TXT_MSG = 3;
-const uint8_t CMD_GET_CHANNEL = 31;   // 0x1F
-const uint8_t CMD_SET_CHANNEL = 32;   // 0x20
 const uint8_t CMD_DEVICE_QUERY = 22;  // 0x16
 
 // MeshCore Protocol Response Codes
@@ -95,10 +93,6 @@ const uint8_t RESP_CODE_ERR = 1;
 const uint8_t RESP_CODE_SELF_INFO = 5;
 const uint8_t RESP_CODE_SENT = 6;
 const uint8_t RESP_CODE_DEVICE_INFO = 13;
-const uint8_t RESP_CODE_CHANNEL_INFO = 18;
-
-// MeshCore Protocol Error Codes
-const uint8_t ERR_CODE_NOT_FOUND = 2;
 
 // Maximum frame payload size (MeshCore limit is 172 bytes, BLE MTU is typically 185-512 after negotiation)
 const uint16_t MAX_FRAME_PAYLOAD = 172;
@@ -106,10 +100,6 @@ const uint16_t MAX_FRAME_PAYLOAD = 172;
 // Note: For BLE, frames are sent/received as raw payloads - no framing markers needed.
 // The USB protocol uses '<' and '>' markers with length prefix, but BLE doesn't need this
 // because each BLE characteristic write/notification is a complete frame.
-
-// MeshCore channel configuration sizes
-const size_t MESH_CHANNEL_NAME_SIZE = 32;
-const size_t MESH_CHANNEL_KEY_SIZE = 16;
 
 // Reserved bytes in CMD_APP_START
 const size_t APP_START_RESERVED_SIZE = 6;
@@ -836,63 +826,9 @@ bool provisionMeshChannel() {
     return false;
   }
 
-  Serial.printf("Checking/provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
-  
-  // First try to get the channel at index 0 to see if it exists
-  uint8_t getChannelCmd[2] = { CMD_GET_CHANNEL, meshChannelIndex };
-  if (!sendMeshFrame(getChannelCmd, sizeof(getChannelCmd))) {
-    lastMeshError = "Failed to send CMD_GET_CHANNEL";
-    return false;
-  }
-  
-  if (!waitForMeshResponse(3000)) {
-    Serial.println("No response to CMD_GET_CHANNEL, will try to set channel");
-  } else if (meshLastResponseCode == RESP_CODE_CHANNEL_INFO) {
-    // Channel exists, we can use it
-    Serial.println("Channel already exists, ready to use");
-    return true;
-  }
-  
-  // Channel doesn't exist or error, try to create/set it
-  // CMD_SET_CHANNEL payload: channel_index (1), name (32 bytes null-padded), key (16 bytes)
-  Serial.printf("Setting channel at index %d...\n", meshChannelIndex);
-  
-  uint8_t setChannelCmd[1 + 1 + MESH_CHANNEL_NAME_SIZE + MESH_CHANNEL_KEY_SIZE];
-  memset(setChannelCmd, 0, sizeof(setChannelCmd));
-  setChannelCmd[0] = CMD_SET_CHANNEL;
-  setChannelCmd[1] = meshChannelIndex;
-  
-  // Copy channel name (up to MESH_CHANNEL_NAME_SIZE bytes, null-padded)
-  size_t nameLen = strlen(BLE_MESH_CHANNEL_NAME);
-  if (nameLen > MESH_CHANNEL_NAME_SIZE) nameLen = MESH_CHANNEL_NAME_SIZE;
-  memcpy(setChannelCmd + 2, BLE_MESH_CHANNEL_NAME, nameLen);
-  
-  // Copy channel key (up to MESH_CHANNEL_KEY_SIZE bytes, null-padded)
-  size_t keyLen = strlen(BLE_MESH_CHANNEL_KEY);
-  if (keyLen > MESH_CHANNEL_KEY_SIZE) keyLen = MESH_CHANNEL_KEY_SIZE;
-  memcpy(setChannelCmd + 2 + MESH_CHANNEL_NAME_SIZE, BLE_MESH_CHANNEL_KEY, keyLen);
-  
-  if (!sendMeshFrame(setChannelCmd, sizeof(setChannelCmd))) {
-    lastMeshError = "Failed to send CMD_SET_CHANNEL";
-    return false;
-  }
-  
-  if (!waitForMeshResponse(3000)) {
-    lastMeshError = "Timeout waiting for channel set response";
-    return false;
-  }
-  
-  if (meshLastResponseCode == RESP_CODE_OK) {
-    Serial.println("Channel set successfully");
-    lastMeshError = "";
-    return true;
-  } else if (meshLastResponseCode == RESP_CODE_ERR) {
-    lastMeshError = "Failed to set channel (device error)";
-    return false;
-  }
-  
-  // Any other response - assume it worked
-  Serial.printf("Received response code 0x%02X, assuming success\n", meshLastResponseCode);
+  // Assume the channel already exists on the MeshCore device
+  // The channel must be pre-configured on the device before use
+  Serial.printf("Using MeshCore channel '%s' (assumed to exist on device)\n", BLE_MESH_CHANNEL_NAME);
   lastMeshError = "";
   return true;
 }

@@ -73,8 +73,7 @@ The firmware now acts as a BLE **client** that connects to the Heltec T114 (Mesh
      ```cpp
      const char* BLE_PEER_NAME = "Heltec-T114";   // the T114's advertised name
      const uint32_t BLE_PAIRING_PIN = 123456;      // the MeshCore pairing PIN
-     const char* BLE_MESH_CHANNEL_NAME = "alerts"; // channel to create/use on the T114
-     const char* BLE_MESH_CHANNEL_KEY = "changeme"; // encryption key provisioned with the channel
+     const char* BLE_MESH_CHANNEL_NAME = "alerts"; // channel to use on the T114 (must already exist on the device)
      // Optional: local name shown by the ESP32 itself
      const char* BLE_DEVICE_NAME = "ESP32-Uptime";
      ```
@@ -83,9 +82,10 @@ The firmware now acts as a BLE **client** that connects to the Heltec T114 (Mesh
      -DBLE_PEER_NAME_VALUE=\"Heltec-T114\"
      -DBLE_PAIRING_PIN_VALUE=123456
      -DBLE_MESH_CHANNEL_NAME_VALUE=\"alerts\"
-     -DBLE_MESH_CHANNEL_KEY_VALUE=\"changeme\"
      -DBLE_DEVICE_NAME_VALUE=\"MyMeshBridge\"
      ```
+   
+   **Note:** The channel must be pre-configured on the MeshCore device before use. The ESP32 will not create or modify the channel.
 
 2. **Flash the firmware and watch the serial monitor**
    - On boot the ESP32 scans for the MeshCore name. Logs will show `MeshCore peer found, attempting connection...` and `Connected to MeshCore peer...` once the link is up. If the peer is missing or the PIN is wrong, the error message appears in `/api/mesh/status`.
@@ -94,7 +94,7 @@ The firmware now acts as a BLE **client** that connects to the Heltec T114 (Mesh
    - Put the T114/MeshCore radio in pairing mode so it advertises with the configured name and accepts the PIN above. The ESP32 will pair, bond, and stay connected; the T114 does **not** subscribe to the ESP32.
 
 4. **Triggering alerts to MeshCore**
-   - The ESP32 acts as a client: it scans for the T114, pairs, **ensures the configured channel exists (creating it with the encryption key if missing)**, and then writes alerts into that channel over the MeshCore characteristic `0b5ad4e1-a62f-41a8-99a1-86a9b8b43964`.
+   - The ESP32 acts as a client: it scans for the T114, pairs, and then writes alerts into the configured channel over the MeshCore characteristic. The channel must already exist on the MeshCore device.
    - You can also send ad-hoc messages via the web API (the ESP32 will connect first if needed):
      ```bash
      curl -X POST http://<device-ip>/api/mesh/send \
