@@ -351,7 +351,11 @@ bool provisionMeshChannel() {
 
   Serial.printf("Provisioning MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
   try {
-    meshMessageCharacteristic->writeValue(payload.c_str(), payload.length(), false);
+    meshMessageCharacteristic->writeValue(
+      reinterpret_cast<uint8_t*>(payload.data()),
+      payload.length(),
+      false
+    );
   } catch (...) {
     lastMeshError = "Failed to provision MeshCore channel";
     return false;
@@ -1008,7 +1012,11 @@ void sendMeshCoreNotification(const String& title, const String& message) {
   String payload;
   serializeJson(doc, payload);
 
-  meshMessageCharacteristic->writeValue(payload.c_str(), payload.length(), false);
+  meshMessageCharacteristic->writeValue(
+    reinterpret_cast<uint8_t*>(payload.data()),
+    payload.length(),
+    false
+  );
 }
 
 String base64Encode(const String& input) {
