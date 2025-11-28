@@ -272,18 +272,12 @@ bool connectToMeshCore() {
   scan->setActiveScan(true);
 
   const int scanSeconds = 10;
-  BLEScanResults* results = scan->start(scanSeconds, false);
+  BLEScanResults results = scan->start(scanSeconds, false);
 
-  if (results == nullptr) {
-    lastMeshError = "BLE scan returned no results";
-    Serial.println("BLE scan returned null results");
-    return false;
-  }
+  Serial.printf("Scan complete: %d devices found\n", results.getCount());
 
-  Serial.printf("Scan complete: %d devices found\n", results->getCount());
-
-  for (int i = 0; i < results->getCount(); i++) {
-    BLEAdvertisedDevice device = results->getDevice(i);
+  for (int i = 0; i < results.getCount(); i++) {
+    BLEAdvertisedDevice device = results.getDevice(i);
 
     // Debug: print what we saw for each advertiser
     std::string rawName = device.getName();
