@@ -80,14 +80,15 @@ const char* NUS_RX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // Notif
 // MeshCore Companion Radio Protocol Commands
 const uint8_t CMD_APP_START = 1;
 const uint8_t CMD_SEND_CHANNEL_TXT_MSG = 3;
-const uint8_t CMD_GET_CHANNEL = 31;
-const uint8_t CMD_SET_CHANNEL = 32;
-const uint8_t CMD_DEVICE_QUERY = 22;
+const uint8_t CMD_GET_CHANNEL = 31;   // 0x1F
+const uint8_t CMD_SET_CHANNEL = 32;   // 0x20
+const uint8_t CMD_DEVICE_QUERY = 22;  // 0x16
 
 // MeshCore Protocol Response Codes
 const uint8_t RESP_CODE_OK = 0;
 const uint8_t RESP_CODE_ERR = 1;
 const uint8_t RESP_CODE_SELF_INFO = 5;
+const uint8_t RESP_CODE_SENT = 6;
 const uint8_t RESP_CODE_DEVICE_INFO = 13;
 const uint8_t RESP_CODE_CHANNEL_INFO = 18;
 
@@ -97,6 +98,9 @@ const uint8_t ERR_CODE_NOT_FOUND = 2;
 // MeshCore Frame markers
 const uint8_t FRAME_OUT_MARKER = '<';  // 0x3C - outgoing frames from client
 const uint8_t FRAME_IN_MARKER = '>';   // 0x3E - incoming frames from device
+
+// Maximum frame payload size (MeshCore limit is 172 bytes for USB, similar for BLE)
+const uint16_t MAX_FRAME_PAYLOAD = 172;
 
 // RX buffer for accumulating BLE notifications
 const int MESH_RX_BUFFER_SIZE = 256;
@@ -123,9 +127,18 @@ static MeshClientCallbacks meshClientCallbacks;
 
 // Notification callback for receiving data from MeshCore device
 void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
-  // Accumulate data in the RX buffer
-  for (size_t i = 0; i < length && meshRxBufferPos < MESH_RX_BUFFER_SIZE; i++) {
-    meshRxBuffer[meshRxBufferPos++] = pData[i];
+  // Accumulate data in the RX buffer with overflow protection
+  size_t bytesToCopy = length;
+  size_t availableSpace = MESH_RX_BUFFER_SIZE - meshRxBufferPos;
+  
+  if (bytesToCopy > availableSpace) {
+    Serial.printf("MeshCore RX buffer overflow: dropping %d bytes\n", (int)(bytesToCopy - availableSpace));
+    bytesToCopy = availableSpace;
+  }
+  
+  if (bytesToCopy > 0) {
+    memcpy(meshRxBuffer + meshRxBufferPos, pData, bytesToCopy);
+    meshRxBufferPos += bytesToCopy;
   }
   
   // Check if we have a complete frame (marker + 2-byte length + payload)
@@ -141,6 +154,7 @@ void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData
       // Shift buffer
       memmove(meshRxBuffer, meshRxBuffer + shift, meshRxBufferPos - shift);
       meshRxBufferPos -= shift;
+      Serial.printf("MeshCore RX: discarded %d bytes of junk data\n", shift);
       continue;
     }
     
@@ -148,7 +162,15 @@ void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData
     if (meshRxBufferPos < 3) break;
     
     uint16_t frameLen = meshRxBuffer[1] | (meshRxBuffer[2] << 8);
-    uint16_t totalLen = 3 + frameLen;
+    
+    // Validate frame length to prevent overflow
+    if (frameLen > MAX_FRAME_PAYLOAD) {
+      Serial.printf("MeshCore RX: invalid frame length %d, resetting buffer\n", frameLen);
+      meshRxBufferPos = 0;
+      break;
+    }
+    
+    int totalLen = 3 + (int)frameLen;
     
     if (meshRxBufferPos < totalLen) break;  // Need more data
     
@@ -170,19 +192,39 @@ void meshNotifyCallback(BLERemoteCharacteristic* pCharacteristic, uint8_t* pData
 
 // Send a frame to the MeshCore device using the Companion Radio Protocol framing
 bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
-  if (!meshDeviceConnected || meshTxCharacteristic == nullptr) {
+  if (!meshDeviceConnected || meshTxCharacteristic == nullptr || meshProtocolState < MESH_STATE_CONNECTED) {
+    return false;
+  }
+  
+  // Validate payload length
+  if (payloadLen > MAX_FRAME_PAYLOAD) {
+    Serial.printf("MeshCore TX: payload too large (%d > %d)\n", (int)payloadLen, MAX_FRAME_PAYLOAD);
     return false;
   }
   
   // Build frame: '<' + len_lo + len_hi + payload
+  // Use stack buffer for typical frame sizes to avoid fragmentation
+  const size_t STACK_BUFFER_SIZE = 180;  // Covers most frames (3 header + up to 177 payload)
   size_t frameLen = 3 + payloadLen;
-  uint8_t* frame = new uint8_t[frameLen];
+  
+  uint8_t stackBuffer[STACK_BUFFER_SIZE];
+  uint8_t* frame = stackBuffer;
+  
+  // Only use heap allocation for larger frames
+  if (frameLen > STACK_BUFFER_SIZE) {
+    frame = new uint8_t[frameLen];
+    if (frame == nullptr) {
+      Serial.println("MeshCore TX failed: memory allocation error");
+      return false;
+    }
+  }
+  
   frame[0] = FRAME_OUT_MARKER;
   frame[1] = payloadLen & 0xFF;
   frame[2] = (payloadLen >> 8) & 0xFF;
   memcpy(frame + 3, payload, payloadLen);
   
-  Serial.printf("MeshCore TX: cmd 0x%02X, payload length %d\n", payload[0], payloadLen);
+  Serial.printf("MeshCore TX: cmd 0x%02X, payload length %d\n", payload[0], (int)payloadLen);
   
   bool success = false;
   try {
@@ -196,7 +238,11 @@ bool sendMeshFrame(const uint8_t* payload, size_t payloadLen) {
     Serial.println("MeshCore TX failed: write error");
   }
   
-  delete[] frame;
+  // Only delete if we used heap allocation
+  if (frame != stackBuffer) {
+    delete[] frame;
+  }
+  
   return success;
 }
 
@@ -1525,8 +1571,10 @@ void sendMeshCoreNotification(const String& title, const String& message) {
       sendCmd[1] = 0;  // txt_type = TXT_TYPE_PLAIN
       sendCmd[2] = meshChannelIndex;
       
-      // Timestamp (current unix time, little-endian)
-      uint32_t timestamp = (uint32_t)(millis() / 1000);  // Simple timestamp (could use NTP if available)
+      // Timestamp - use 0 to indicate "now" to the device, which will use its own clock
+      // The MeshCore device typically has a more accurate time source
+      // Alternative: Use NTP time if available before WiFi disconnect
+      uint32_t timestamp = 0;
       sendCmd[3] = timestamp & 0xFF;
       sendCmd[4] = (timestamp >> 8) & 0xFF;
       sendCmd[5] = (timestamp >> 16) & 0xFF;
@@ -1538,7 +1586,7 @@ void sendMeshCoreNotification(const String& title, const String& message) {
       if (sendMeshFrame(sendCmd, cmdLen)) {
         // Wait for send confirmation
         if (waitForMeshResponse(5000)) {
-          if (meshLastResponseCode == RESP_CODE_OK || meshLastResponseCode == 0x06) {  // RESP_CODE_SENT = 6
+          if (meshLastResponseCode == RESP_CODE_OK || meshLastResponseCode == RESP_CODE_SENT) {
             Serial.println("MeshCore notification sent successfully");
           } else {
             Serial.printf("MeshCore notification: unexpected response 0x%02X\n", meshLastResponseCode);
