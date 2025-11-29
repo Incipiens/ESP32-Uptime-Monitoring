@@ -47,7 +47,10 @@ public:
     // Protocol limits
     static constexpr size_t APP_START_RESERVED_SIZE = 6;
     static constexpr size_t MAX_TEXT_MESSAGE_LEN = 140;
-    static constexpr uint8_t MAX_MESH_CHANNELS = 8;
+    // Maximum number of channels to query when searching by name.
+    // MeshCore firmware can allocate more than eight channel slots, so scan a
+    // broader range to avoid missing valid user-created channels.
+    static constexpr uint8_t MAX_MESH_CHANNELS = 16;
     static constexpr size_t MAX_RX_BUFFER_SIZE = 256;
 
     // Protocol state machine
