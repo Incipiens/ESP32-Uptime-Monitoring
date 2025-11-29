@@ -901,18 +901,17 @@ bool provisionMeshChannel() {
     // Parse the channel info response
     // RESP_CODE_CHANNEL_INFO payload: response_code(1) + channel_index(1) + name(32) + secret(16)
     // Total expected: 1 + 1 + 32 + 16 = 50 bytes
-    if (meshRxPayloadLen >= 34) {  // At minimum: resp_code + index + partial name
+    if (meshRxPayloadLen >= 34) {  // At minimum: resp_code + index + name(32)
       uint8_t respChannelIndex = meshRxBuffer[1];
       
-      // Extract channel name (32 bytes starting at offset 2, null-terminated or fixed length)
+      // Extract channel name (32 bytes starting at offset 2, fixed length field)
       char channelName[33] = {0};
-      size_t copyLen = (meshRxPayloadLen >= 34) ? 32 : (meshRxPayloadLen - 2);
-      memcpy(channelName, meshRxBuffer + 2, copyLen);
+      memcpy(channelName, meshRxBuffer + 2, 32);
       channelName[32] = '\0';  // Ensure null termination
       
-      // Trim trailing spaces/nulls for comparison
+      // Trim trailing spaces for comparison (MeshCore pads names with spaces)
       size_t nameLen = strlen(channelName);
-      while (nameLen > 0 && (channelName[nameLen-1] == ' ' || channelName[nameLen-1] == '\0')) {
+      while (nameLen > 0 && channelName[nameLen-1] == ' ') {
         channelName[--nameLen] = '\0';
       }
       
