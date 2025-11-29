@@ -90,17 +90,18 @@ const char* NUS_TX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // Write
 const char* NUS_RX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // Notifications from this
 
 // MeshCore Companion Radio Protocol Commands
+// Reference: https://github.com/meshcore-dev/MeshCore/blob/main/examples/companion_radio/MyMesh.cpp
 const uint8_t CMD_APP_START = 1;
 const uint8_t CMD_SEND_CHANNEL_TXT_MSG = 3;
-const uint8_t CMD_GET_CHANNELS = 18;  // 0x12 - Get list of channels
-const uint8_t CMD_DEVICE_QUERY = 22;  // 0x16
+const uint8_t CMD_GET_CHANNEL = 31;   // 0x1F - Get single channel by index
+const uint8_t CMD_DEVICE_QUERY = 22;  // 0x16 (spelled QEURY in MeshCore)
 
 // MeshCore Protocol Response Codes
 const uint8_t RESP_CODE_OK = 0;
 const uint8_t RESP_CODE_ERR = 1;
 const uint8_t RESP_CODE_SELF_INFO = 5;
 const uint8_t RESP_CODE_SENT = 6;
-const uint8_t RESP_CODE_CHANNEL_INFO = 8;  // 0x08 - Channel information
+const uint8_t RESP_CODE_CHANNEL_INFO = 18;  // 0x12 - Channel information response
 const uint8_t RESP_CODE_DEVICE_INFO = 13;
 
 // Maximum number of channels supported by MeshCore
@@ -861,8 +862,9 @@ bool provisionMeshChannel() {
   }
 
   // Query the MeshCore device for available channels to find the one matching BLE_MESH_CHANNEL_NAME
-  // CMD_GET_CHANNELS: cmd(1) + starting_index(1)
-  // Start from index 0 and iterate through all channels
+  // CMD_GET_CHANNEL (31): cmd(1) + channel_index(1)
+  // Returns RESP_CODE_CHANNEL_INFO (18) with: response_code(1) + channel_index(1) + name(32) + secret(16)
+  // Or RESP_CODE_ERR if channel index is invalid
   
   Serial.printf("Searching for MeshCore channel '%s'...\n", BLE_MESH_CHANNEL_NAME);
   
@@ -870,39 +872,48 @@ bool provisionMeshChannel() {
   uint8_t queryIndex = 0;
   
   while (queryIndex < MAX_MESH_CHANNELS && !channelFound) {
-    uint8_t getChannelsCmd[2] = { CMD_GET_CHANNELS, queryIndex };
+    uint8_t getChannelCmd[2] = { CMD_GET_CHANNEL, queryIndex };
     
-    if (!sendMeshFrame(getChannelsCmd, sizeof(getChannelsCmd))) {
-      lastMeshError = "Failed to send CMD_GET_CHANNELS";
+    if (!sendMeshFrame(getChannelCmd, sizeof(getChannelCmd))) {
+      lastMeshError = "Failed to send CMD_GET_CHANNEL";
       return false;
     }
     
     if (!waitForMeshResponse(5000)) {
-      // No more channels available
+      // No response - communication problem
       Serial.printf("No response for channel index %d, stopping search\n", queryIndex);
       break;
     }
     
+    if (meshLastResponseCode == RESP_CODE_ERR) {
+      // Channel index doesn't exist, stop searching
+      Serial.printf("Channel index %d not found (RESP_CODE_ERR), stopping search\n", queryIndex);
+      break;
+    }
+    
     if (meshLastResponseCode != RESP_CODE_CHANNEL_INFO) {
-      // No more channels or error
-      Serial.printf("Received response code 0x%02X for channel index %d, stopping search\n", 
+      // Unexpected response code
+      Serial.printf("Unexpected response code 0x%02X for channel index %d, stopping search\n", 
                     meshLastResponseCode, queryIndex);
       break;
     }
     
     // Parse the channel info response
-    // RESP_CODE_CHANNEL_INFO payload: response_code(1) + channel_index(1) + channel_name(variable, null-terminated)
-    if (meshRxPayloadLen >= 3) {
+    // RESP_CODE_CHANNEL_INFO payload: response_code(1) + channel_index(1) + name(32) + secret(16)
+    // Total expected: 1 + 1 + 32 + 16 = 50 bytes
+    if (meshRxPayloadLen >= 34) {  // At minimum: resp_code + index + name(32)
       uint8_t respChannelIndex = meshRxBuffer[1];
       
-      // Extract channel name (starts at offset 2, null-terminated string)
-      char channelName[64] = {0};
-      size_t nameLen = (meshRxPayloadLen > 2) ? meshRxPayloadLen - 2 : 0;
-      if (nameLen > sizeof(channelName) - 1) {
-        nameLen = sizeof(channelName) - 1;
+      // Extract channel name (32 bytes starting at offset 2, fixed length field)
+      char channelName[33] = {0};
+      memcpy(channelName, meshRxBuffer + 2, 32);
+      channelName[32] = '\0';  // Ensure null termination
+      
+      // Trim trailing spaces for comparison (MeshCore pads names with spaces)
+      size_t nameLen = strlen(channelName);
+      while (nameLen > 0 && channelName[nameLen-1] == ' ') {
+        channelName[--nameLen] = '\0';
       }
-      memcpy(channelName, meshRxBuffer + 2, nameLen);
-      channelName[nameLen] = '\0';
       
       Serial.printf("Found channel %d: '%s'\n", respChannelIndex, channelName);
       
@@ -912,6 +923,9 @@ bool provisionMeshChannel() {
         channelFound = true;
         Serial.printf("Matched! Using channel index %d for '%s'\n", meshChannelIndex, BLE_MESH_CHANNEL_NAME);
       }
+    } else {
+      Serial.printf("Channel info response too short (%d bytes) for index %d\n", 
+                    meshRxPayloadLen, queryIndex);
     }
     
     queryIndex++;
