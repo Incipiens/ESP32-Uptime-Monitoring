@@ -92,6 +92,7 @@ public:
 
 private:
     class ClientCallbacks;
+    class SecurityCallbacks;
     
     // Static notification callback for BLE
     static void notifyCallback(BLERemoteCharacteristic* pCharacteristic, 
@@ -118,4 +119,7 @@ private:
     
     // Client callbacks instance
     ClientCallbacks* m_clientCallbacks = nullptr;
+    
+    // Security callbacks instance  
+    SecurityCallbacks* m_securityCallbacks = nullptr;
 };

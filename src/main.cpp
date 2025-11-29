@@ -1068,19 +1068,19 @@ void sendMeshCoreNotification(const String& title, const String& message) {
             Serial.println("MeshCore notification sent successfully");
             success = true;
           } else {
-            Serial.println("MeshCore notification failed: send error");
+            Serial.printf("MeshCore notification failed: send error - %s\n", protocol.getLastError().c_str());
           }
         } else {
-          Serial.println("MeshCore notification skipped: channel not found");
+          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol.getLastError().c_str());
         }
       } else {
-        Serial.println("MeshCore notification skipped: session start failed");
+        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol.getLastError().c_str());
       }
     } else {
-      Serial.println("MeshCore notification skipped: not connected");
+      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport.getLastError().c_str());
     }
   } else {
-    Serial.println("MeshCore notification skipped: BLE init failed");
+    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport.getLastError().c_str());
   }
   
   // Disconnect BLE and deinitialize to free resources

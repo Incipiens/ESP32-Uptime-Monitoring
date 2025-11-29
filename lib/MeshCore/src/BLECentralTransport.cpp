@@ -14,6 +14,7 @@ public:
     explicit ClientCallbacks(BLECentralTransport* transport) : m_transport(transport) {}
 
     void onConnect(BLEClient* client) override {
+        Serial.println("BLE ClientCallbacks: onConnect triggered");
         m_transport->m_connected = true;
         m_transport->m_lastError = "";
         if (m_transport->m_stateCallback) {
@@ -22,6 +23,7 @@ public:
     }
 
     void onDisconnect(BLEClient* client) override {
+        Serial.println("BLE ClientCallbacks: onDisconnect triggered");
         m_transport->m_connected = false;
         m_transport->m_txCharacteristic = nullptr;
         m_transport->m_rxCharacteristic = nullptr;
@@ -34,16 +36,62 @@ private:
     BLECentralTransport* m_transport;
 };
 
+// Security callbacks class for BLE pairing/bonding
+class BLECentralTransport::SecurityCallbacks : public BLESecurityCallbacks {
+public:
+    explicit SecurityCallbacks(uint32_t pin) : m_pin(pin) {}
+
+    // Called when the peripheral requests a passkey from us (Central with keyboard)
+    uint32_t onPassKeyRequest() override {
+        Serial.printf("BLE Security: Passkey requested, providing PIN: %lu\n", m_pin);
+        return m_pin;
+    }
+
+    // Called when we should display a passkey (Central with display)
+    void onPassKeyNotify(uint32_t pass_key) override {
+        Serial.printf("BLE Security: Passkey to display: %lu\n", pass_key);
+    }
+
+    // Called to ask if we should accept security request from peripheral
+    bool onSecurityRequest() override {
+        Serial.println("BLE Security: Security request received, accepting");
+        return true;
+    }
+
+    // Called when authentication is complete
+    void onAuthenticationComplete(esp_ble_auth_cmpl_t auth_cmpl) override {
+        if (auth_cmpl.success) {
+            Serial.println("BLE Security: Authentication complete - SUCCESS");
+            Serial.printf("  Auth mode: %d, Key type: %d\n", 
+                          auth_cmpl.auth_mode, auth_cmpl.key_type);
+        } else {
+            Serial.printf("BLE Security: Authentication FAILED - reason: %d\n", 
+                          auth_cmpl.fail_reason);
+        }
+    }
+
+    // Called to confirm if displayed passkey matches
+    bool onConfirmPIN(uint32_t pin) override {
+        Serial.printf("BLE Security: Confirm PIN %lu? Accepting.\n", pin);
+        return true;
+    }
+
+private:
+    uint32_t m_pin;
+};
+
 BLECentralTransport::BLECentralTransport(const Config& config)
     : m_config(config)
 {
     s_instance = this;
     m_clientCallbacks = new ClientCallbacks(this);
+    m_securityCallbacks = new SecurityCallbacks(config.pairingPin);
 }
 
 BLECentralTransport::~BLECentralTransport() {
     deinit();
     delete m_clientCallbacks;
+    delete m_securityCallbacks;
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -65,12 +113,22 @@ bool BLECentralTransport::init() {
     Serial.printf("BLE initialized successfully as '%s'\n", m_config.deviceName);
     Serial.printf("Free heap after BLE init: %d bytes\n", ESP.getFreeHeap());
 
-    // Set up PIN-based pairing
+    // Set up security callbacks to handle pairing with MeshCore device
+    // This is essential for the peripheral to recognize us as properly connected
+    BLEDevice::setSecurityCallbacks(m_securityCallbacks);
+    
+    // Configure BLE security for Central role connecting to a secured peripheral
+    // ESP_IO_CAP_KBDISP = Keyboard + Display (we can input and display PINs)
+    // This allows us to respond to passkey requests from the MeshCore device
+    BLEDevice::setEncryptionLevel(ESP_BLE_SEC_ENCRYPT_MITM);
+    
     BLESecurity* security = new BLESecurity();
     security->setAuthenticationMode(ESP_LE_AUTH_REQ_SC_MITM_BOND);
-    security->setCapability(ESP_IO_CAP_OUT);
+    security->setCapability(ESP_IO_CAP_KBDISP);
     security->setInitEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
-    security->setStaticPIN(m_config.pairingPin);
+    security->setRespEncryptionKey(ESP_BLE_ENC_KEY_MASK | ESP_BLE_ID_KEY_MASK);
+    
+    Serial.printf("BLE Security configured with PIN: %lu\n", m_config.pairingPin);
 
     return true;
 }
@@ -308,16 +366,24 @@ bool BLECentralTransport::connect() {
             continue;
         }
 
-        // Register for notifications
-        rxChar->registerForNotify(notifyCallback);
-
-        // Enable notifications on CCCD
+        // Register for notifications with explicit parameters
+        // Parameters: callback, notifications=true, descriptorRequiresRegistration=true
+        // The ESP-IDF library requires calling esp_ble_gattc_register_for_notify before
+        // notifications will be received, and also writing to the CCCD descriptor.
+        rxChar->registerForNotify(notifyCallback, true, true);
+        
+        // Some MeshCore devices require an additional CCCD write after registration
+        // to properly enable notifications. This redundant write ensures compatibility.
         BLERemoteDescriptor* cccd = rxChar->getDescriptor(BLEUUID((uint16_t)0x2902));
         if (cccd != nullptr) {
             uint8_t notifyOn[] = {0x01, 0x00};
             cccd->writeValue(notifyOn, sizeof(notifyOn), true);
+            Serial.println("CCCD notification bit enabled");
+        } else {
+            Serial.println("Warning: CCCD descriptor not found");
         }
-
+        
+        // Wait for notification registration to complete
         delay(m_config.notifyRegistrationDelayMs);
 
         m_txCharacteristic = txChar;
