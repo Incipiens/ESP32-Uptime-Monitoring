@@ -52,6 +52,15 @@ public:
     // broader range to avoid missing valid user-created channels.
     static constexpr uint8_t MAX_MESH_CHANNELS = 16;
     static constexpr size_t MAX_RX_BUFFER_SIZE = 256;
+    
+    // Maximum known MeshCore response/command code value.
+    // Used to detect fragmented BLE responses where raw continuation data
+    // is incorrectly interpreted as a command byte. All valid MeshCore
+    // protocol response codes are <= this value. Bytes > this threshold
+    // appearing as "commands" are assumed to be continuation data from
+    // fragmented BLE responses (due to MTU limitations).
+    // Current known codes: 0x00-0x16 for responses, 0x1F for commands.
+    static constexpr uint8_t MAX_KNOWN_RESPONSE_CODE = 0x20;
 
     // Protocol state machine
     enum class State {

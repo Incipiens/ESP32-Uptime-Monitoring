@@ -25,6 +25,7 @@ constexpr size_t CompanionProtocol::APP_START_RESERVED_SIZE;
 constexpr size_t CompanionProtocol::MAX_TEXT_MESSAGE_LEN;
 constexpr uint8_t CompanionProtocol::MAX_MESH_CHANNELS;
 constexpr size_t CompanionProtocol::MAX_RX_BUFFER_SIZE;
+constexpr uint8_t CompanionProtocol::MAX_KNOWN_RESPONSE_CODE;
 
 CompanionProtocol::CompanionProtocol(BLECentralTransport& transport, FrameCodec& codec)
     : m_transport(transport)
@@ -92,6 +93,42 @@ void CompanionProtocol::onDisconnected() {
 
 void CompanionProtocol::onFrame(uint8_t cmd, const uint8_t* payload, size_t payloadLen) {
     Serial.printf("CompanionProtocol: received frame cmd=0x%02X, len=%d\n", cmd, (int)payloadLen);
+    
+    // Check if this looks like continuation data for a fragmented response.
+    // MeshCore response codes are in the low range (0x00-MAX_KNOWN_RESPONSE_CODE).
+    // Higher values are likely the first byte of continuation data from a fragmented
+    // BLE response, not actual command codes.
+    // 
+    // When BLE MTU is too small to hold a complete response, the data is split
+    // across multiple BLE notifications. The first notification has the valid
+    // response code, but subsequent notifications contain raw continuation data
+    // where the first byte happens to be interpreted as a "command" by our framing.
+    bool isLikelyContinuation = (cmd > MAX_KNOWN_RESPONSE_CODE) && m_expectedResponseCaptured && 
+                                 (m_capturedBufferLen > 0);
+    
+    if (isLikelyContinuation) {
+        // Append continuation data to the captured buffer
+        // The "cmd" byte is actually part of the data, not a command
+        size_t totalNewData = 1 + payloadLen;  // cmd byte + payload
+        size_t newTotalLen = m_capturedBufferLen + totalNewData;
+        
+        if (newTotalLen <= sizeof(m_capturedBuffer)) {
+            // Append the frame data (including the "cmd" byte which is data)
+            m_capturedBuffer[m_capturedBufferLen] = cmd;
+            if (payload != nullptr && payloadLen > 0) {
+                memcpy(m_capturedBuffer + m_capturedBufferLen + 1, payload, payloadLen);
+            }
+            m_capturedBufferLen = newTotalLen;
+            Serial.printf("CompanionProtocol: appended continuation data, total %u bytes\n", 
+                          (unsigned int)m_capturedBufferLen);
+        } else {
+            Serial.printf("CompanionProtocol: continuation would overflow buffer (%u + %u > %u)\n",
+                          (unsigned int)m_capturedBufferLen, (unsigned int)totalNewData, 
+                          (unsigned int)sizeof(m_capturedBuffer));
+        }
+        // Don't overwrite m_lastResponseCode or m_rxBuffer for continuation data
+        return;
+    }
     
     m_lastResponseCode = cmd;
     

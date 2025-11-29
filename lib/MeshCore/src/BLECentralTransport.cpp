@@ -4,6 +4,7 @@
 constexpr const char* BLECentralTransport::NUS_SERVICE_UUID;
 constexpr const char* BLECentralTransport::NUS_TX_CHAR_UUID;
 constexpr const char* BLECentralTransport::NUS_RX_CHAR_UUID;
+constexpr uint16_t BLECentralTransport::PREFERRED_MTU_SIZE;
 
 // Static instance pointer for callbacks
 BLECentralTransport* BLECentralTransport::s_instance = nullptr;
@@ -312,7 +313,21 @@ bool BLECentralTransport::connect() {
             continue;
         }
 
-        delay(m_config.mtuNegotiationDelayMs);
+        // Request a larger MTU to handle MeshCore protocol responses.
+        // See PREFERRED_MTU_SIZE documentation for rationale.
+        uint16_t negotiatedMtu = m_client->getMTU();
+        Serial.printf("Initial MTU: %d, requesting MTU: %d\n", negotiatedMtu, PREFERRED_MTU_SIZE);
+        
+        // setMTU() will trigger MTU exchange with the peer
+        if (m_client->setMTU(PREFERRED_MTU_SIZE)) {
+            // Wait for MTU negotiation to complete
+            delay(m_config.mtuNegotiationDelayMs);
+            negotiatedMtu = m_client->getMTU();
+            Serial.printf("MTU negotiated: %d bytes\n", negotiatedMtu);
+        } else {
+            Serial.println("MTU negotiation failed, using default MTU");
+            delay(m_config.mtuNegotiationDelayMs);
+        }
 
         // Service discovery with retries
         BLERemoteService* service = nullptr;

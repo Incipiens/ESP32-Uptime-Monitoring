@@ -25,6 +25,13 @@ public:
     static constexpr const char* NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
     static constexpr const char* NUS_TX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";  // Write to this
     static constexpr const char* NUS_RX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";  // Notifications from this
+    
+    // Preferred MTU size for BLE connection.
+    // MeshCore channel info responses are ~50 bytes (cmd + index + 32-byte name + 16-byte secret).
+    // Request larger MTU to receive complete responses in single BLE notifications instead of
+    // having them fragmented. With 3-byte ATT header overhead, we need MTU > 53 for channel info.
+    // 185 bytes provides margin for larger messages and matches typical BLE 4.2+ capabilities.
+    static constexpr uint16_t PREFERRED_MTU_SIZE = 185;
 
     // Configuration for BLE timing
     struct Config {
