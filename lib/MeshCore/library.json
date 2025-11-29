@@ -1,0 +1,8 @@
+{
+    "name": "MeshCore",
+    "version": "1.0.0",
+    "description": "MeshCore Companion Radio Protocol implementation for ESP32",
+    "keywords": "meshcore, ble, protocol, esp32",
+    "frameworks": "arduino",
+    "platforms": "espressif32"
+}

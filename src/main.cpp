@@ -1,17 +1,92 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <ESPAsyncWebServer.h>
 #include <ArduinoJson.h>
 #include <FS.h>
 #include <LittleFS.h>
 #include <HTTPClient.h>
 #include <ESP32Ping.h>
+#include <mbedtls/base64.h>
 
-// WiFi credentials, need to update these with your network details
-const char* WIFI_SSID = "xxx";
-const char* WIFI_PASSWORD = "xxx";
+// MeshCore layered protocol implementation
+#include "MeshCore.hpp"
+
+#include "config.hpp"
+
+bool isNtfyConfigured() {
+  return strlen(NTFY_TOPIC) > 0;
+}
+
+bool isDiscordConfigured() {
+  return strlen(DISCORD_WEBHOOK_URL) > 0;
+}
+
+bool isSmtpConfigured() {
+  return strlen(SMTP_SERVER) > 0 && strlen(SMTP_FROM_ADDRESS) > 0 &&
+         strlen(SMTP_TO_ADDRESS) > 0;
+}
+
+bool isMeshCoreConfigured() {
+  return strlen(BLE_PEER_NAME) > 0;
+}
+
+void sendNtfyNotification(const String& title, const String& message, const String& tags = "warning,monitor");
+void sendDiscordNotification(const String& title, const String& message);
+void sendSmtpNotification(const String& title, const String& message);
+void sendMeshCoreNotification(const String& title, const String& message);
+void scanBLEDevices();
+void initMeshCore();
+void disconnectMeshCore();
+void disconnectWiFi();
+void reconnectWiFi();
 
 AsyncWebServer server(80);
+
+// MeshCore Protocol Stack (layered architecture)
+// Layer 1: BLE Transport - handles BLE connection and I/O
+// Layer 2: Frame Codec - handles frame parsing/building  
+// Layer 3: Companion Protocol - handles MeshCore protocol logic
+static BLECentralTransport* meshTransport = nullptr;
+static FrameCodec* meshCodec = nullptr;
+static CompanionProtocol* meshProtocol = nullptr;
+
+// BLE/WiFi coexistence - ESP32-S3 cannot run WiFi and BLE simultaneously
+bool bleOperationInProgress = false;
+bool monitoringPaused = false;
+
+// Pending MeshCore notification - used to defer BLE operations from HTTP handlers
+// This prevents task watchdog timeouts by allowing the async web server to complete
+// HTTP response delivery before WiFi is disconnected for BLE operations.
+volatile bool pendingMeshNotification = false;
+String pendingMeshTitle = "";
+String pendingMeshMessage = "";
+
+// Helper functions to access protocol state (for API compatibility)
+bool isMeshDeviceConnected() {
+  return meshTransport != nullptr && meshTransport->isConnected();
+}
+
+bool isMeshChannelReady() {
+  return meshProtocol != nullptr && meshProtocol->isChannelReady();
+}
+
+String getMeshLastError() {
+  if (meshProtocol != nullptr) {
+    return meshProtocol->getLastError();
+  }
+  if (meshTransport != nullptr) {
+    return meshTransport->getLastError();
+  }
+  return "";
+}
+
+int getMeshProtocolState() {
+  if (meshProtocol != nullptr) {
+    return static_cast<int>(meshProtocol->getState());
+  }
+  return 0;
+}
 
 // Service types
 // Right now the behavior for each is rudimentary
@@ -33,6 +108,10 @@ struct Service {
   String path;
   String expectedResponse;
   int checkInterval;
+  int passThreshold;      // Number of consecutive passes required to mark as UP
+  int failThreshold;      // Number of consecutive fails required to mark as DOWN
+  int consecutivePasses;  // Current count of consecutive passes
+  int consecutiveFails;   // Current count of consecutive fails
   bool isUp;
   unsigned long lastCheck;
   unsigned long lastUptime;
@@ -49,16 +128,23 @@ int serviceCount = 0;
 void initWiFi();
 void initWebServer();
 void initFileSystem();
+bool ensureAuthenticated(AsyncWebServerRequest* request);
 void loadServices();
 void saveServices();
 String generateServiceId();
 void checkServices();
+void sendOfflineNotification(const Service& service);
+void sendOnlineNotification(const Service& service);
+void sendSmtpNotification(const String& title, const String& message);
 bool checkHomeAssistant(Service& service);
 bool checkJellyfin(Service& service);
 bool checkHttpGet(Service& service);
 bool checkPing(Service& service);
 String getWebPage();
 String getServiceTypeString(ServiceType type);
+String base64Encode(const String& input);
+bool readSmtpResponse(WiFiClient& client, int expectedCode);
+bool sendSmtpCommand(WiFiClient& client, const String& command, int expectedCode);
 
 void setup() {
   Serial.begin(115200);
@@ -69,7 +155,11 @@ void setup() {
   // Initialize filesystem
   initFileSystem();
 
-  // Initialize WiFi
+  // Scan for BLE devices at boot and log them to serial monitor
+  // This runs before WiFi to avoid ESP32-S3 WiFi/BLE coexistence issues
+  scanBLEDevices();
+
+  // Initialize WiFi (BLE is deinitialized after scan to allow this)
   initWiFi();
 
   // Load saved services
@@ -86,6 +176,32 @@ void setup() {
 void loop() {
   static unsigned long lastCheckTime = 0;
   unsigned long currentTime = millis();
+
+  // Process pending MeshCore notifications from HTTP handlers
+  // This runs in the main loop to avoid blocking the async web server
+  // and prevents task watchdog timeouts from WiFi/BLE switching during HTTP responses
+  if (pendingMeshNotification && !bleOperationInProgress) {
+    // Copy values and clear flag atomically to prevent race conditions with HTTP handler.
+    // The HTTP handler checks both pendingMeshNotification and bleOperationInProgress
+    // before writing, so setting the flag false first prevents new writes.
+    // We use noInterrupts()/interrupts() to ensure the copy is atomic since
+    // the async web server runs in a separate FreeRTOS task.
+    noInterrupts();
+    pendingMeshNotification = false;
+    String title = pendingMeshTitle;
+    String message = pendingMeshMessage;
+    pendingMeshTitle = "";
+    pendingMeshMessage = "";
+    interrupts();
+    
+    sendMeshCoreNotification(title, message);
+  }
+
+  // Skip service checks if monitoring is paused (e.g., during BLE operations)
+  if (monitoringPaused) {
+    delay(10);
+    return;
+  }
 
   // Check services every 5 seconds
   if (currentTime - lastCheckTime >= 5000) {
@@ -117,19 +233,231 @@ void initWiFi() {
   }
 }
 
-void initFileSystem() {
-  if (!LittleFS.begin(true)) {
-    Serial.println("Failed to mount LittleFS");
+void initMeshCore() {
+  Serial.println("Initializing MeshCore protocol stack...");
+  Serial.printf("Free heap before init: %d bytes\n", ESP.getFreeHeap());
+  
+  // Create the layered protocol stack
+  BLECentralTransport::Config config;
+  config.deviceName = BLE_DEVICE_NAME;
+  config.peerName = BLE_PEER_NAME;
+  config.pairingPin = BLE_PAIRING_PIN;
+  
+  meshTransport = new BLECentralTransport(config);
+  meshCodec = new FrameCodec(*meshTransport);
+  meshProtocol = new CompanionProtocol(*meshTransport, *meshCodec);
+  
+  // Initialize and connect
+  if (!meshTransport->init()) {
+    Serial.println("ERROR: BLE initialization failed");
+    disconnectMeshCore();  // Clean up allocated objects
     return;
   }
-  Serial.println("LittleFS mounted successfully");
+  
+  if (!meshTransport->connect()) {
+    Serial.println("MeshCore connection failed");
+    disconnectMeshCore();  // Clean up allocated objects
+    return;
+  }
+  
+  // Start session
+  if (!meshProtocol->startSession("ESP32-Uptime")) {
+    Serial.println("MeshCore session start failed");
+    disconnectMeshCore();  // Clean up allocated objects
+    return;
+  }
+  
+  // Find the configured channel
+  uint8_t channelIdx;
+  if (!meshProtocol->findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+    Serial.println("Channel not found");
+    disconnectMeshCore();  // Clean up allocated objects
+    return;
+  }
+  
+  Serial.printf("MeshCore ready on channel %d\n", channelIdx);
+}
+
+void scanBLEDevices() {
+  Serial.println("========================================");
+  Serial.println("Starting BLE device scan...");
+  Serial.println("========================================");
+  
+  // Create temporary transport for scanning
+  BLECentralTransport::Config config;
+  config.deviceName = BLE_DEVICE_NAME;
+  config.peerName = BLE_PEER_NAME;
+  config.pairingPin = BLE_PAIRING_PIN;
+  
+  BLECentralTransport scanTransport(config);
+  scanTransport.scanDevices();
+  scanTransport.deinit();
+  
+  Serial.println("========================================");
+  Serial.println("BLE scan complete, BLE deinitialized for WiFi usage");
+  Serial.println("NOTE: BLE will be re-initialized on-demand when sending MeshCore notifications");
+  Serial.println("========================================");
+}
+
+bool ensureAuthenticated(AsyncWebServerRequest* request) {
+  if (strlen(WEB_AUTH_USERNAME) == 0 || strlen(WEB_AUTH_PASSWORD) == 0) {
+    return true;
+  }
+
+  if (request->authenticate(WEB_AUTH_USERNAME, WEB_AUTH_PASSWORD)) {
+    return true;
+  }
+
+  request->requestAuthentication();
+  return false;
+}
+
+void initFileSystem() {
+  // First attempt: try to mount without formatting
+  if (LittleFS.begin(false)) {
+    Serial.println("LittleFS mounted successfully");
+    return;
+  }
+
+  Serial.println("LittleFS mount failed, attempting format...");
+
+  // If mount fails, explicitly format the filesystem first
+  // This handles severely corrupted filesystems better than begin(true)
+  if (!LittleFS.format()) {
+    Serial.println("LittleFS format failed! Check partition table and flash configuration.");
+    return;
+  }
+
+  Serial.println("LittleFS formatted successfully");
+
+  // Now try to mount the freshly formatted filesystem
+  if (!LittleFS.begin(false)) {
+    Serial.println("Critical: Failed to mount LittleFS after successful format!");
+    return;
+  }
+
+  Serial.println("LittleFS mounted successfully after format");
+}
+
+void disconnectMeshCore() {
+  // Clean up the layered protocol stack
+  if (meshProtocol != nullptr) {
+    delete meshProtocol;
+    meshProtocol = nullptr;
+  }
+  
+  if (meshCodec != nullptr) {
+    delete meshCodec;
+    meshCodec = nullptr;
+  }
+  
+  if (meshTransport != nullptr) {
+    meshTransport->disconnect();
+    meshTransport->deinit();
+    delete meshTransport;
+    meshTransport = nullptr;
+  }
+  
+  Serial.println("MeshCore disconnected and deinitialized");
+}
+
+void disconnectWiFi() {
+  Serial.println("Disconnecting WiFi for BLE operation...");
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+  delay(100); // Allow WiFi to fully shut down
+  Serial.println("WiFi disconnected");
+}
+
+void reconnectWiFi() {
+  Serial.println("Reconnecting WiFi after BLE operation...");
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 30) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi reconnected!");
+    Serial.print("IP address: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\nFailed to reconnect to WiFi!");
+  }
 }
 
 void initWebServer() {
 
   server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+    if (!ensureAuthenticated(request)) {
+      return;
+    }
     request->send(200, "text/html", getWebPage());
   });
+
+  server.on("/api/mesh/status", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    doc["connected"] = isMeshDeviceConnected();
+    doc["peerName"] = BLE_PEER_NAME;
+    doc["deviceName"] = BLE_DEVICE_NAME;
+    doc["channel"] = BLE_MESH_CHANNEL_NAME;
+    doc["channelReady"] = isMeshChannelReady();
+    doc["protocolState"] = getMeshProtocolState();
+    doc["lastError"] = getMeshLastError();
+    doc["bleOperationInProgress"] = bleOperationInProgress;
+    doc["pendingNotification"] = (bool)pendingMeshNotification;
+    doc["monitoringPaused"] = monitoringPaused;
+
+    String response;
+    serializeJson(doc, response);
+    request->send(200, "application/json", response);
+  });
+
+  server.on("/api/mesh/send", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (!ensureAuthenticated(request)) {
+        return;
+      }
+
+      // Check if a BLE operation is already in progress or queued
+      if (bleOperationInProgress || pendingMeshNotification) {
+        request->send(503, "application/json", "{\"error\":\"BLE operation already in progress\"}");
+        return;
+      }
+
+      JsonDocument doc;
+      if (deserializeJson(doc, data, len) != DeserializationError::Ok) {
+        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+
+      String title = doc["title"] | "Mesh Message";
+      String message = doc["message"] | "";
+      if (message.length() == 0) {
+        request->send(400, "application/json", "{\"error\":\"Missing message\"}");
+        return;
+      }
+
+      // Queue the notification to be processed in the main loop.
+      // This prevents task watchdog timeouts by allowing the async web server
+      // to fully complete HTTP response delivery before WiFi is disconnected
+      // for BLE operations. The ESP32-S3 cannot run WiFi and BLE simultaneously,
+      // so we must ensure the HTTP response is sent before switching to BLE.
+      // Use noInterrupts()/interrupts() to ensure atomic write since the main
+      // loop() reads these variables from a different FreeRTOS task context.
+      noInterrupts();
+      pendingMeshTitle = title;
+      pendingMeshMessage = message;
+      pendingMeshNotification = true;
+      interrupts();
+      
+      request->send(202, "application/json", "{\"success\":true,\"status\":\"queued\"}");
+    }
+  );
 
   // get services
   server.on("/api/services", HTTP_GET, [](AsyncWebServerRequest *request) {
@@ -154,6 +482,10 @@ void initWebServer() {
       obj["path"] = services[i].path;
       obj["expectedResponse"] = services[i].expectedResponse;
       obj["checkInterval"] = services[i].checkInterval;
+      obj["passThreshold"] = services[i].passThreshold;
+      obj["failThreshold"] = services[i].failThreshold;
+      obj["consecutivePasses"] = services[i].consecutivePasses;
+      obj["consecutiveFails"] = services[i].consecutiveFails;
       obj["isUp"] = services[i].isUp;
       obj["secondsSinceLastCheck"] = services[i].secondsSinceLastCheck;
       obj["lastError"] = services[i].lastError;
@@ -167,6 +499,9 @@ void initWebServer() {
   // add service
   server.on("/api/services", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
     [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (!ensureAuthenticated(request)) {
+        return;
+      }
       if (serviceCount >= MAX_SERVICES) {
         request->send(400, "application/json", "{\"error\":\"Maximum services reached\"}");
         return;
@@ -203,6 +538,17 @@ void initWebServer() {
       newService.path = doc["path"] | "/";
       newService.expectedResponse = doc["expectedResponse"] | "*";
       newService.checkInterval = doc["checkInterval"] | 60;
+
+      int passThreshold = doc["passThreshold"] | 1;
+      if (passThreshold < 1) passThreshold = 1;
+      newService.passThreshold = passThreshold;
+
+      int failThreshold = doc["failThreshold"] | 1;
+      if (failThreshold < 1) failThreshold = 1;
+      newService.failThreshold = failThreshold;
+
+      newService.consecutivePasses = 0;
+      newService.consecutiveFails = 0;
       newService.isUp = false;
       newService.lastCheck = 0;
       newService.lastUptime = 0;
@@ -224,6 +570,9 @@ void initWebServer() {
 
   // delete service
   server.on("/api/services/*", HTTP_DELETE, [](AsyncWebServerRequest *request) {
+    if (!ensureAuthenticated(request)) {
+      return;
+    }
     String path = request->url();
     String serviceId = path.substring(path.lastIndexOf('/') + 1);
 
@@ -250,6 +599,139 @@ void initWebServer() {
     request->send(200, "application/json", "{\"success\":true}");
   });
 
+  // export services configuration
+  server.on("/api/export", HTTP_GET, [](AsyncWebServerRequest *request) {
+    JsonDocument doc;
+    JsonArray array = doc["services"].to<JsonArray>();
+
+    for (int i = 0; i < serviceCount; i++) {
+      JsonObject obj = array.add<JsonObject>();
+      obj["name"] = services[i].name;
+      obj["type"] = getServiceTypeString(services[i].type);
+      obj["host"] = services[i].host;
+      obj["port"] = services[i].port;
+      obj["path"] = services[i].path;
+      obj["expectedResponse"] = services[i].expectedResponse;
+      obj["checkInterval"] = services[i].checkInterval;
+      obj["passThreshold"] = services[i].passThreshold;
+      obj["failThreshold"] = services[i].failThreshold;
+    }
+
+    String response;
+    serializeJson(doc, response);
+
+    AsyncWebServerResponse *res = request->beginResponse(200, "application/json", response);
+    res->addHeader("Content-Disposition", "attachment; filename=\"monitors-backup.json\"");
+    request->send(res);
+  });
+
+  // import services configuration
+  server.on("/api/import", HTTP_POST, [](AsyncWebServerRequest *request) {}, NULL,
+    [](AsyncWebServerRequest *request, uint8_t *data, size_t len, size_t index, size_t total) {
+      if (!ensureAuthenticated(request)) {
+        return;
+      }
+      // Limit payload size to 16KB to prevent DoS
+      if (total > 16384) {
+        request->send(400, "application/json", "{\"error\":\"Payload too large\"}");
+        return;
+      }
+
+      JsonDocument doc;
+      DeserializationError error = deserializeJson(doc, data, len);
+
+      if (error) {
+        request->send(400, "application/json", "{\"error\":\"Invalid JSON\"}");
+        return;
+      }
+
+      JsonArray array = doc["services"];
+      if (array.isNull()) {
+        request->send(400, "application/json", "{\"error\":\"Missing services array\"}");
+        return;
+      }
+
+      int importedCount = 0;
+      int skippedCount = 0;
+
+      for (JsonObject obj : array) {
+        if (serviceCount >= MAX_SERVICES) {
+          skippedCount++;
+          continue;
+        }
+
+        // Validate required fields
+        String name = obj["name"].as<String>();
+        String host = obj["host"].as<String>();
+        if (name.length() == 0 || host.length() == 0) {
+          skippedCount++;
+          continue;
+        }
+
+        String typeStr = obj["type"].as<String>();
+        ServiceType type;
+        if (typeStr == "home_assistant") {
+          type = TYPE_HOME_ASSISTANT;
+        } else if (typeStr == "jellyfin") {
+          type = TYPE_JELLYFIN;
+        } else if (typeStr == "http_get") {
+          type = TYPE_HTTP_GET;
+        } else if (typeStr == "ping") {
+          type = TYPE_PING;
+        } else {
+          skippedCount++;
+          continue;
+        }
+
+        // Validate and constrain numeric values
+        int port = obj["port"] | 80;
+        if (port < 1 || port > 65535) port = 80;
+
+        int checkInterval = obj["checkInterval"] | 60;
+        if (checkInterval < 10) checkInterval = 10;
+
+        int passThreshold = obj["passThreshold"] | 1;
+        if (passThreshold < 1) passThreshold = 1;
+
+        int failThreshold = obj["failThreshold"] | 1;
+        if (failThreshold < 1) failThreshold = 1;
+
+        Service newService;
+        newService.id = generateServiceId();
+        newService.name = name;
+        newService.type = type;
+        newService.host = host;
+        newService.port = port;
+        newService.path = obj["path"] | "/";
+        newService.expectedResponse = obj["expectedResponse"] | "*";
+        newService.checkInterval = checkInterval;
+        newService.passThreshold = passThreshold;
+        newService.failThreshold = failThreshold;
+        newService.consecutivePasses = 0;
+        newService.consecutiveFails = 0;
+        newService.isUp = false;
+        newService.lastCheck = 0;
+        newService.lastUptime = 0;
+        newService.lastError = "";
+        newService.secondsSinceLastCheck = -1;
+
+        services[serviceCount++] = newService;
+        importedCount++;
+      }
+
+      saveServices();
+
+      JsonDocument response;
+      response["success"] = true;
+      response["imported"] = importedCount;
+      response["skipped"] = skippedCount;
+
+      String responseStr;
+      serializeJson(response, responseStr);
+      request->send(200, "application/json", responseStr);
+    }
+  );
+
   server.begin();
   Serial.println("Web server started");
 }
@@ -267,34 +749,60 @@ void checkServices() {
       continue;
     }
 
+    bool firstCheck = services[i].lastCheck == 0;
     services[i].lastCheck = currentTime;
     bool wasUp = services[i].isUp;
 
+    // Perform the actual check
+    bool checkResult = false;
     switch (services[i].type) {
       case TYPE_HOME_ASSISTANT:
-        services[i].isUp = checkHomeAssistant(services[i]);
+        checkResult = checkHomeAssistant(services[i]);
         break;
       case TYPE_JELLYFIN:
-        services[i].isUp = checkJellyfin(services[i]);
+        checkResult = checkJellyfin(services[i]);
         break;
       case TYPE_HTTP_GET:
-        services[i].isUp = checkHttpGet(services[i]);
+        checkResult = checkHttpGet(services[i]);
         break;
       case TYPE_PING:
-        services[i].isUp = checkPing(services[i]);
+        checkResult = checkPing(services[i]);
         break;
     }
 
-    if (services[i].isUp) {
+    // Update consecutive counters based on check result
+    if (checkResult) {
+      services[i].consecutivePasses++;
+      services[i].consecutiveFails = 0;
       services[i].lastUptime = currentTime;
       services[i].lastError = "";
+    } else {
+      services[i].consecutiveFails++;
+      services[i].consecutivePasses = 0;
     }
 
-    // Log status changes
+    // Determine new state based on thresholds
+    if (!services[i].isUp && services[i].consecutivePasses >= services[i].passThreshold) {
+      // Service has passed enough times to be considered UP
+      services[i].isUp = true;
+    } else if (services[i].isUp && services[i].consecutiveFails >= services[i].failThreshold) {
+      // Service has failed enough times to be considered DOWN
+      services[i].isUp = false;
+    }
+
+    // Log and notify on state changes
     if (wasUp != services[i].isUp) {
-      Serial.printf("Service '%s' is now %s\n",
+      Serial.printf("Service '%s' is now %s (after %d consecutive %s)\n",
         services[i].name.c_str(),
-        services[i].isUp ? "UP" : "DOWN");
+        services[i].isUp ? "UP" : "DOWN",
+        services[i].isUp ? services[i].consecutivePasses : services[i].consecutiveFails,
+        services[i].isUp ? "passes" : "fails");
+
+      if (!services[i].isUp) {
+        sendOfflineNotification(services[i]);
+      } else if (!firstCheck) {
+        sendOnlineNotification(services[i]);
+      }
     }
   }
 }
@@ -384,6 +892,323 @@ bool checkPing(Service& service) {
   return success;
 }
 
+void sendOfflineNotification(const Service& service) {
+  if (!isNtfyConfigured() && !isDiscordConfigured() && !isSmtpConfigured() && !isMeshCoreConfigured()) {
+    return;
+  }
+
+  bool wifiConnected = WiFi.status() == WL_CONNECTED;
+
+  String title = "Service DOWN: " + service.name;
+  String message = "Service '" + service.name + "' at " + service.host;
+  if (service.port > 0) {
+    message += ":" + String(service.port);
+  }
+  message += " is offline.";
+
+  if (service.lastError.length() > 0) {
+    message += " Error: " + service.lastError;
+  }
+
+  if (wifiConnected) {
+    if (isNtfyConfigured()) {
+      sendNtfyNotification(title, message, "warning,monitor");
+    }
+
+    if (isDiscordConfigured()) {
+      sendDiscordNotification(title, message);
+    }
+
+    if (isSmtpConfigured()) {
+      sendSmtpNotification(title, message);
+    }
+  } else {
+    Serial.println("WiFi offline: skipping internet notifications");
+  }
+
+  sendMeshCoreNotification(title, message);
+}
+
+void sendOnlineNotification(const Service& service) {
+  if (!isNtfyConfigured() && !isDiscordConfigured() && !isSmtpConfigured() && !isMeshCoreConfigured()) {
+    return;
+  }
+
+  bool wifiConnected = WiFi.status() == WL_CONNECTED;
+
+  String title = "Service UP: " + service.name;
+  String message = "Service '" + service.name + "' at " + service.host;
+  if (service.port > 0) {
+    message += ":" + String(service.port);
+  }
+  message += " is back online.";
+
+  if (wifiConnected) {
+    if (isNtfyConfigured()) {
+      sendNtfyNotification(title, message, "ok,monitor");
+    }
+
+    if (isDiscordConfigured()) {
+      sendDiscordNotification(title, message);
+    }
+
+    if (isSmtpConfigured()) {
+      sendSmtpNotification(title, message);
+    }
+  } else {
+    Serial.println("WiFi offline: skipping internet notifications");
+  }
+
+  sendMeshCoreNotification(title, message);
+}
+
+void sendNtfyNotification(const String& title, const String& message, const String& tags) {
+  HTTPClient http;
+  String url = String(NTFY_SERVER) + "/" + NTFY_TOPIC;
+
+  WiFiClientSecure client;
+  bool isSecure = url.startsWith("https://");
+  if (isSecure) {
+    client.setInsecure();
+    http.begin(client, url);
+  } else {
+    http.begin(url);
+  }
+  http.addHeader("Title", title);
+  http.addHeader("Tags", tags);
+  http.addHeader("Content-Type", "text/plain");
+
+  if (strlen(NTFY_ACCESS_TOKEN) > 0) {
+    http.addHeader("Authorization", "Bearer " + String(NTFY_ACCESS_TOKEN));
+  } else if (strlen(NTFY_USERNAME) > 0) {
+    http.setAuthorization(NTFY_USERNAME, NTFY_PASSWORD);
+  }
+
+  int httpCode = http.POST(message);
+
+  if (httpCode > 0) {
+    Serial.printf("ntfy notification sent: %d\n", httpCode);
+  } else {
+    Serial.printf("Failed to send ntfy notification: %d\n", httpCode);
+  }
+
+  http.end();
+}
+
+void sendDiscordNotification(const String& title, const String& message) {
+  HTTPClient http;
+  String url = String(DISCORD_WEBHOOK_URL);
+
+  WiFiClientSecure client;
+  bool isSecure = url.startsWith("https://");
+  if (isSecure) {
+    client.setInsecure();
+    http.begin(client, url);
+  } else {
+    http.begin(url);
+  }
+
+  http.addHeader("Content-Type", "application/json");
+
+  JsonDocument doc;
+  doc["content"] = "**" + title + "**\n" + message;
+
+  String payload;
+  serializeJson(doc, payload);
+
+  int httpCode = http.POST(payload);
+
+  if (httpCode > 0) {
+    Serial.printf("Discord notification sent: %d\n", httpCode);
+  } else {
+    Serial.printf("Failed to send Discord notification: %d\n", httpCode);
+  }
+
+  http.end();
+}
+
+void sendMeshCoreNotification(const String& title, const String& message) {
+  // ESP32-S3 cannot run WiFi and BLE simultaneously
+  // Disconnect WiFi, connect BLE, send message, disconnect BLE, reconnect WiFi
+  
+  Serial.println("Starting MeshCore notification (BLE operation)...");
+  
+  // Pause monitoring to prevent false positives during network transition
+  monitoringPaused = true;
+  bleOperationInProgress = true;
+  
+  // Disconnect WiFi before starting BLE
+  disconnectWiFi();
+  
+  // Create the layered protocol stack on demand
+  BLECentralTransport::Config config;
+  config.deviceName = BLE_DEVICE_NAME;
+  config.peerName = BLE_PEER_NAME;
+  config.pairingPin = BLE_PAIRING_PIN;
+  
+  BLECentralTransport transport(config);
+  FrameCodec codec(transport);
+  CompanionProtocol protocol(transport, codec);
+  
+  bool success = false;
+  
+  // Initialize and connect
+  if (transport.init()) {
+    if (transport.connect()) {
+      // Start session
+      if (protocol.startSession("ESP32-Uptime")) {
+        // Find the configured channel
+        uint8_t channelIdx;
+        if (protocol.findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+          // Build the message: combine title and message
+          String fullMessage = title + ": " + message;
+          
+          // Send using the protocol layer
+          if (protocol.sendTextMessageToChannel(channelIdx, fullMessage)) {
+            Serial.println("MeshCore notification sent successfully");
+            success = true;
+          } else {
+            Serial.printf("MeshCore notification failed: send error - %s\n", protocol.getLastError().c_str());
+          }
+        } else {
+          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol.getLastError().c_str());
+        }
+      } else {
+        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol.getLastError().c_str());
+      }
+    } else {
+      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport.getLastError().c_str());
+    }
+  } else {
+    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport.getLastError().c_str());
+  }
+  
+  // Disconnect BLE and deinitialize to free resources
+  transport.disconnect();
+  transport.deinit();
+  
+  // Reconnect WiFi
+  reconnectWiFi();
+  
+  // Resume monitoring
+  bleOperationInProgress = false;
+  monitoringPaused = false;
+  
+  Serial.println("MeshCore notification operation complete");
+}
+
+String base64Encode(const String& input) {
+  size_t outputLength = 0;
+  size_t bufferLength = ((input.length() + 2) / 3) * 4 + 4;
+  unsigned char* output = new unsigned char[bufferLength];
+
+  int result = mbedtls_base64_encode(
+    output,
+    bufferLength,
+    &outputLength,
+    reinterpret_cast<const unsigned char*>(input.c_str()),
+    input.length()
+  );
+
+  String encoded = "";
+  if (result == 0) {
+    encoded = String(reinterpret_cast<char*>(output), outputLength);
+  }
+
+  delete[] output;
+  return encoded;
+}
+
+bool readSmtpResponse(WiFiClient& client, int expectedCode) {
+  unsigned long timeout = millis() + 5000;
+  String line;
+  int code = -1;
+
+  do {
+    while (!client.available() && millis() < timeout) {
+      delay(10);
+    }
+
+    if (!client.available()) {
+      Serial.println("SMTP response timeout");
+      return false;
+    }
+
+    line = client.readStringUntil('\n');
+    line.trim();
+    if (line.length() >= 3) {
+      code = line.substring(0, 3).toInt();
+    }
+  } while (line.length() >= 4 && line.charAt(3) == '-');
+
+  if (code != expectedCode) {
+    Serial.printf("SMTP unexpected response (expected %d): %s\n", expectedCode, line.c_str());
+    return false;
+  }
+
+  return true;
+}
+
+bool sendSmtpCommand(WiFiClient& client, const String& command, int expectedCode) {
+  client.println(command);
+  return readSmtpResponse(client, expectedCode);
+}
+
+void sendSmtpNotification(const String& title, const String& message) {
+  WiFiClient plainClient;
+  WiFiClientSecure secureClient;
+  WiFiClient* client = &plainClient;
+
+  if (SMTP_USE_TLS) {
+    secureClient.setInsecure();
+    client = &secureClient;
+  }
+
+  if (!client->connect(SMTP_SERVER, SMTP_PORT)) {
+    Serial.println("Failed to connect to SMTP server");
+    return;
+  }
+
+  if (!readSmtpResponse(*client, 220)) return;
+  if (!sendSmtpCommand(*client, "EHLO esp32-monitor", 250)) return;
+
+  if (strlen(SMTP_USERNAME) > 0) {
+    if (!sendSmtpCommand(*client, "AUTH LOGIN", 334)) return;
+    if (!sendSmtpCommand(*client, base64Encode(SMTP_USERNAME), 334)) return;
+    if (!sendSmtpCommand(*client, base64Encode(SMTP_PASSWORD), 235)) return;
+  }
+
+  if (!sendSmtpCommand(*client, "MAIL FROM:<" + String(SMTP_FROM_ADDRESS) + ">", 250)) return;
+
+  String recipients = String(SMTP_TO_ADDRESS);
+  recipients.replace(" ", "");
+  int start = 0;
+  while (start < recipients.length()) {
+    int commaIndex = recipients.indexOf(',', start);
+    if (commaIndex == -1) commaIndex = recipients.length();
+    String address = recipients.substring(start, commaIndex);
+    if (address.length() > 0) {
+      if (!sendSmtpCommand(*client, "RCPT TO:<" + address + ">", 250)) return;
+    }
+    start = commaIndex + 1;
+  }
+
+  if (!sendSmtpCommand(*client, "DATA", 354)) return;
+
+  client->printf("From: <%s>\r\n", SMTP_FROM_ADDRESS);
+  client->printf("To: %s\r\n", SMTP_TO_ADDRESS);
+  client->printf("Subject: %s\r\n", title.c_str());
+  client->println("Content-Type: text/plain; charset=\"UTF-8\"\r\n");
+  client->println(message);
+  client->println(".");
+
+  if (!readSmtpResponse(*client, 250)) return;
+  sendSmtpCommand(*client, "QUIT", 221);
+  client->stop();
+
+  Serial.println("SMTP notification sent");
+}
+
 void saveServices() {
   File file = LittleFS.open("/services.json", "w");
   if (!file) {
@@ -404,9 +1229,13 @@ void saveServices() {
     obj["path"] = services[i].path;
     obj["expectedResponse"] = services[i].expectedResponse;
     obj["checkInterval"] = services[i].checkInterval;
+    obj["passThreshold"] = services[i].passThreshold;
+    obj["failThreshold"] = services[i].failThreshold;
   }
 
-  serializeJson(doc, file);
+  if (serializeJson(doc, file) == 0) {
+    Serial.println("Failed to serialize services.json");
+  }
   file.close();
   Serial.println("Services saved");
 }
@@ -441,6 +1270,10 @@ void loadServices() {
     services[serviceCount].path = obj["path"].as<String>();
     services[serviceCount].expectedResponse = obj["expectedResponse"].as<String>();
     services[serviceCount].checkInterval = obj["checkInterval"];
+    services[serviceCount].passThreshold = obj["passThreshold"] | 1;
+    services[serviceCount].failThreshold = obj["failThreshold"] | 1;
+    services[serviceCount].consecutivePasses = 0;
+    services[serviceCount].consecutiveFails = 0;
     services[serviceCount].isUp = false;
     services[serviceCount].lastCheck = 0;
     services[serviceCount].lastUptime = 0;
@@ -580,6 +1413,44 @@ String getWebPage() {
 
         .btn-danger:hover {
             background: #dc2626;
+        }
+
+        .btn-secondary {
+            background: #6b7280;
+            color: white;
+        }
+
+        .btn-secondary:hover {
+            background: #4b5563;
+        }
+
+        .card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 12px;
+            margin-bottom: 20px;
+        }
+
+        .backup-actions {
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+        }
+
+        .backup-actions input[type="file"] {
+            display: none;
+        }
+
+        .backup-actions .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            height: 44px;
+            padding: 0 18px;
+            line-height: 1;
+            box-sizing: border-box;
         }
 
         .services-grid {
@@ -724,7 +1595,14 @@ String getWebPage() {
         <div id="alertContainer"></div>
 
         <div class="card">
-            <h2 style="margin-bottom: 20px; color: #1f2937;">Add New Service</h2>
+            <div class="card-header">
+                <h2 style="margin: 0; color: #1f2937;">Add New Service</h2>
+                <div class="backup-actions">
+                    <button type="button" class="btn btn-secondary" onclick="exportServices()">Export Monitors</button>
+                    <label class="btn btn-secondary" for="importFile">Import Monitors</label>
+                    <input type="file" id="importFile" accept=".json" onchange="importServices(this.files[0])">
+                </div>
+            </div>
             <form id="addServiceForm" class="add-service-form">
                 <div class="form-group">
                     <label for="serviceName">Service Name</label>
@@ -757,6 +1635,18 @@ String getWebPage() {
                     <div class="form-group">
                         <label for="checkInterval">Check Interval (seconds)</label>
                         <input type="number" id="checkInterval" value="60" required min="10">
+                    </div>
+                </div>
+
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="failThreshold">Fail Threshold</label>
+                        <input type="number" id="failThreshold" value="1" required min="1" title="Number of consecutive failures before marking as DOWN">
+                    </div>
+
+                    <div class="form-group">
+                        <label for="passThreshold">Pass Threshold</label>
+                        <input type="number" id="passThreshold" value="1" required min="1" title="Number of consecutive successes before marking as UP">
                     </div>
                 </div>
 
@@ -827,7 +1717,9 @@ String getWebPage() {
                 port: parseInt(document.getElementById('servicePort').value),
                 path: document.getElementById('servicePath').value,
                 expectedResponse: document.getElementById('expectedResponse').value,
-                checkInterval: parseInt(document.getElementById('checkInterval').value)
+                checkInterval: parseInt(document.getElementById('checkInterval').value),
+                passThreshold: parseInt(document.getElementById('passThreshold').value),
+                failThreshold: parseInt(document.getElementById('failThreshold').value)
             };
 
             try {
@@ -916,6 +1808,12 @@ String getWebPage() {
                             <strong>Check Interval:</strong> ${service.checkInterval}s
                         </div>
                         <div class="service-info">
+                            <strong>Thresholds:</strong> ${service.failThreshold} fail / ${service.passThreshold} pass
+                        </div>
+                        <div class="service-info">
+                            <strong>Consecutive:</strong> ${service.consecutivePasses} passes / ${service.consecutiveFails} fails
+                        </div>
+                        <div class="service-info">
                             <strong>Last Check:</strong> ${uptimeStr}
                         </div>
                         ${service.lastError ? `
@@ -964,6 +1862,40 @@ String getWebPage() {
             setTimeout(() => {
                 alert.remove();
             }, 3000);
+        }
+
+        // Export services
+        function exportServices() {
+            window.location.href = '/api/export';
+        }
+
+        // Import services
+        async function importServices(file) {
+            if (!file) return;
+
+            try {
+                const text = await file.text();
+                const response = await fetch('/api/import', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: text
+                });
+
+                const result = await response.json();
+
+                if (response.ok) {
+                    showAlert(`Imported ${result.imported} service(s)` + 
+                        (result.skipped > 0 ? `, skipped ${result.skipped}` : ''), 'success');
+                    loadServices();
+                } else {
+                    showAlert('Import failed: ' + (result.error || 'Unknown error'), 'error');
+                }
+            } catch (error) {
+                showAlert('Error: ' + error.message, 'error');
+            }
+
+            // Reset file input
+            document.getElementById('importFile').value = '';
         }
 
         // Auto-refresh services every 5 seconds
