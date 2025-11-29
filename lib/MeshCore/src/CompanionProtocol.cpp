@@ -216,15 +216,17 @@ bool CompanionProtocol::startSession(const String& appName) {
             return false;
         }
 
-        if (!waitForExpectedResponse(RESP_CODE_DEVICE_INFO, 0xFF, 5000)) {
-            m_lastError = "Timeout waiting for RESP_CODE_DEVICE_INFO";
+        // Accept both RESP_CODE_DEVICE_INFO and RESP_CODE_OK as valid responses.
+        // Different MeshCore firmware versions may respond differently to CMD_DEVICE_QUERY.
+        if (!waitForExpectedResponse(RESP_CODE_DEVICE_INFO, RESP_CODE_OK, 5000)) {
+            m_lastError = "Timeout waiting for device query response";
             return false;
         }
 
-        if (m_lastResponseCode != RESP_CODE_DEVICE_INFO) {
+        if (m_lastResponseCode != RESP_CODE_DEVICE_INFO && m_lastResponseCode != RESP_CODE_OK) {
             m_lastError = "Unexpected response to CMD_DEVICE_QUERY";
-            Serial.printf("Expected RESP_CODE_DEVICE_INFO (0x%02X), got 0x%02X\n", 
-                          RESP_CODE_DEVICE_INFO, m_lastResponseCode);
+            Serial.printf("Expected RESP_CODE_DEVICE_INFO (0x%02X) or RESP_CODE_OK (0x%02X), got 0x%02X\n", 
+                          RESP_CODE_DEVICE_INFO, RESP_CODE_OK, m_lastResponseCode);
             return false;
         }
 
