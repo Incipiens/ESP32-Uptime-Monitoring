@@ -217,6 +217,13 @@ private:
     size_t m_capturedBufferLen = 0;
     uint8_t m_capturedResponseCode = 0xFF;
     
+    // Expected response tracking - used to capture matching responses atomically in onFrame
+    // This prevents race conditions where multiple BLE notifications arrive before the
+    // polling loop can check them, causing the correct response to be overwritten.
+    volatile uint8_t m_expectedCode = 0xFF;
+    volatile uint8_t m_altCode = 0xFF;
+    volatile bool m_expectedResponseCaptured = false;
+    
     // Channel info
     bool m_channelReady = false;
     uint8_t m_channelIndex = 0;
