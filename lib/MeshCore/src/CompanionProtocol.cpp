@@ -108,6 +108,26 @@ void CompanionProtocol::onFrame(uint8_t cmd, const uint8_t* payload, size_t payl
         m_rxPayloadLen = 0;
     }
     
+    // Check if this is the expected response and capture it atomically.
+    // This fixes a race condition where multiple BLE notifications arrive before
+    // the polling loop in waitForExpectedResponse can check them, causing the
+    // correct response (e.g., 0x0D RESP_CODE_DEVICE_INFO) to be overwritten by
+    // subsequent frames before being processed.
+    if (!m_expectedResponseCaptured && m_expectedCode != 0xFF) {
+        bool isExpected = (cmd == m_expectedCode) || 
+                          (m_altCode != 0xFF && cmd == m_altCode);
+        if (isExpected) {
+            // Capture immediately to prevent subsequent frames from overwriting
+            m_capturedResponseCode = cmd;
+            m_capturedBufferLen = m_rxPayloadLen;
+            if (m_rxPayloadLen > 0 && m_rxPayloadLen <= sizeof(m_capturedBuffer)) {
+                memcpy(m_capturedBuffer, m_rxBuffer, m_rxPayloadLen);
+            }
+            m_expectedResponseCaptured = true;
+            Serial.printf("CompanionProtocol: captured expected response 0x%02X\n", cmd);
+        }
+    }
+    
     m_responseReceived = true;
     
     // Handle push messages (unsolicited)
@@ -156,17 +176,34 @@ bool CompanionProtocol::waitForResponse(unsigned long timeoutMs) {
 bool CompanionProtocol::waitForExpectedResponse(uint8_t expectedCode, uint8_t altCode, unsigned long timeoutMs) {
     unsigned long start = millis();
     
-    // Clear captured buffer at start
+    // Set up expected response tracking atomically.
+    // Order is critical: first disable capturing, then set expected codes.
+    // This prevents onFrame from capturing with stale expected codes.
+    m_expectedResponseCaptured = false;
     m_capturedBufferLen = 0;
     m_capturedResponseCode = 0xFF;
+    // Now set expected codes - onFrame will start matching after both are set
+    m_altCode = altCode;
+    m_expectedCode = expectedCode;  // Set this last as it enables matching in onFrame
     
     while ((millis() - start) < timeoutMs) {
+        // Check if onFrame has already captured the expected response atomically
+        if (m_expectedResponseCaptured) {
+            // Response was captured in onFrame - just update m_lastResponseCode for callers
+            m_lastResponseCode = m_capturedResponseCode;
+            // Clear expected response tracking
+            m_expectedCode = 0xFF;
+            m_altCode = 0xFF;
+            return true;
+        }
+        
         if (!m_responseReceived) {
             delay(10);
             continue;
         }
         
-        // Check if we got the expected response
+        // Check if we got the expected response (fallback for responses received before
+        // m_expectedCode was set, though this should rarely happen)
         if (m_lastResponseCode == expectedCode || 
             (altCode != 0xFF && m_lastResponseCode == altCode)) {
             // Capture the buffer contents immediately to prevent async notifications
@@ -176,6 +213,9 @@ bool CompanionProtocol::waitForExpectedResponse(uint8_t expectedCode, uint8_t al
             if (m_rxPayloadLen > 0 && m_rxPayloadLen <= sizeof(m_capturedBuffer)) {
                 memcpy(m_capturedBuffer, m_rxBuffer, m_rxPayloadLen);
             }
+            // Clear expected response tracking
+            m_expectedCode = 0xFF;
+            m_altCode = 0xFF;
             return true;
         }
         
@@ -193,9 +233,15 @@ bool CompanionProtocol::waitForExpectedResponse(uint8_t expectedCode, uint8_t al
         if (m_rxPayloadLen > 0 && m_rxPayloadLen <= sizeof(m_capturedBuffer)) {
             memcpy(m_capturedBuffer, m_rxBuffer, m_rxPayloadLen);
         }
+        // Clear expected response tracking
+        m_expectedCode = 0xFF;
+        m_altCode = 0xFF;
         return true;
     }
     
+    // Clear expected response tracking on timeout
+    m_expectedCode = 0xFF;
+    m_altCode = 0xFF;
     return false;  // Timeout
 }
 
