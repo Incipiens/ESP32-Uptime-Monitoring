@@ -165,8 +165,12 @@ void setup() {
   initWebServer();
 
   // Send boot notification if enabled and WiFi is connected
-  if (BOOT_NOTIFICATION_ENABLED && WiFi.status() == WL_CONNECTED) {
-    sendBootNotification();
+  if (BOOT_NOTIFICATION_ENABLED) {
+    if (WiFi.status() == WL_CONNECTED) {
+      sendBootNotification();
+    } else {
+      Serial.println("Boot notification skipped: WiFi not connected");
+    }
   }
 
   Serial.println("System ready!");

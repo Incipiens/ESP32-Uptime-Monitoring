@@ -172,11 +172,13 @@ Configure an SMTP relay to receive email alerts for uptime changes.
 
 Optionally send a notification to all configured channels when the device boots up.
 
-1. In `src/config.cpp`, enable boot notifications:
+1. In `src/config.cpp`, find the boot notification configuration and change the default value:
    ```cpp
-   const bool BOOT_NOTIFICATION_ENABLED = true;
+   #ifndef BOOT_NOTIFICATION_ENABLED_VALUE
+   #define BOOT_NOTIFICATION_ENABLED_VALUE true  // Change from false to true
+   #endif
    ```
-2. Alternatively, enable via PlatformIO build flag:
+2. Alternatively, enable via PlatformIO build flag (no file edits needed):
    ```ini
    -DBOOT_NOTIFICATION_ENABLED_VALUE=true
    ```
