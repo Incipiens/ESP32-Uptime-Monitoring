@@ -13,11 +13,11 @@
 //   -DBOOT_NOTIFICATION_ENABLED_VALUE=true
 
 #ifndef WIFI_SSID_VALUE
-#define WIFI_SSID_VALUE "Nacho Wi-Fi"
+#define WIFI_SSID_VALUE "xxx"
 #endif
 
 #ifndef WIFI_PASSWORD_VALUE
-#define WIFI_PASSWORD_VALUE "brownCow36"
+#define WIFI_PASSWORD_VALUE "xxx"
 #endif
 
 #ifndef WEB_AUTH_USERNAME_VALUE
@@ -29,23 +29,23 @@
 #endif
 
 #ifndef BLE_DEVICE_NAME_VALUE
-#define BLE_DEVICE_NAME_VALUE "BC-ESP32-Uptime"
+#define BLE_DEVICE_NAME_VALUE "ESP32-Uptime"
 #endif
 
 #ifndef BLE_PEER_NAME_VALUE
-#define BLE_PEER_NAME_VALUE "MeshCore-C07FAE14"
+#define BLE_PEER_NAME_VALUE "MeshCore-xxx"
 #endif
 
 #ifndef BLE_PAIRING_PIN_VALUE
-#define BLE_PAIRING_PIN_VALUE 223124
+#define BLE_PAIRING_PIN_VALUE 123456
 #endif
 
 #ifndef BLE_MESH_CHANNEL_NAME_VALUE
-#define BLE_MESH_CHANNEL_NAME_VALUE "BCAlerts"
+#define BLE_MESH_CHANNEL_NAME_VALUE "Alerts"
 #endif
 
 #ifndef NTFY_SERVER_VALUE
-#define NTFY_SERVER_VALUE "https://ntfy.hawkinsit.au"
+#define NTFY_SERVER_VALUE "https://ntfy.sh"
 #endif
 
 #ifndef NTFY_TOPIC_VALUE
@@ -61,7 +61,7 @@
 #endif
 
 #ifndef NTFY_PASSWORD_VALUE
-#define NTFY_PASSWORD_VALUE "*E6k@IUw$NwNr9^1WtbanWIhhE8Ic^lZ"
+#define NTFY_PASSWORD_VALUE ""
 #endif
 
 #ifndef DISCORD_WEBHOOK_URL_VALUE
