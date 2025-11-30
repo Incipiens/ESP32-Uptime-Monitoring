@@ -143,8 +143,12 @@ const int MAX_QUEUED_NOTIFICATIONS = MAX_SERVICES;
 QueuedNotification notificationQueue[MAX_QUEUED_NOTIFICATIONS];
 int queuedNotificationCount = 0;
 
-// Retry interval for failed notifications (30 seconds)
+// Retry interval for failed notifications (30 seconds for WiFi-based)
 const unsigned long NOTIFICATION_RETRY_INTERVAL = 30000;
+
+// MeshCore retry interval (10 minutes to prevent frequent WiFi disconnects)
+const unsigned long MESHCORE_RETRY_INTERVAL = 600000;
+unsigned long lastMeshCoreRetry = 0;
 
 // prototype declarations
 void initWiFi();
@@ -180,6 +184,7 @@ void queueNotification(const String& serviceId, const String& title, const Strin
                        bool isUp, const String& tags, bool ntfyFailed, bool discordFailed, 
                        bool smtpFailed, bool meshFailed);
 void processNotificationQueue();
+void processMeshCoreQueue();
 int findQueuedNotification(const String& serviceId);
 void removeQueuedNotification(int index);
 
@@ -251,8 +256,11 @@ void loop() {
     lastCheckTime = currentTime;
   }
 
-  // Process notification queue for failed notifications
+  // Process notification queue for failed notifications (WiFi-based)
   processNotificationQueue();
+  
+  // Process MeshCore queue separately (batched, 10 minute interval)
+  processMeshCoreQueue();
 
   delay(10);
 }
@@ -1584,7 +1592,7 @@ void processNotificationQueue() {
   unsigned long currentTime = millis();
   bool wifiConnected = WiFi.status() == WL_CONNECTED;
   
-  // Process each queued notification
+  // Process each queued notification (WiFi-based channels only)
   for (int i = 0; i < queuedNotificationCount; i++) {
     QueuedNotification& notification = notificationQueue[i];
     
@@ -1619,20 +1627,120 @@ void processNotificationQueue() {
       }
     }
     
-    // Retry MeshCore notification (requires special handling due to BLE/WiFi switching)
-    if (notification.meshPending && isMeshCoreConfigured() && !bleOperationInProgress) {
-      if (sendMeshCoreNotificationWithStatus(notification.title, notification.message)) {
-        notification.meshPending = false;
-        Serial.printf("Retry: MeshCore notification sent for %s\n", notification.serviceId.c_str());
-      }
-    }
-    
     // Check if all pending notifications for this service have been sent
+    // (MeshCore is processed separately in processMeshCoreQueue)
     if (!notification.ntfyPending && !notification.discordPending && 
         !notification.smtpPending && !notification.meshPending) {
       Serial.printf("All notifications sent for %s, removing from queue\n", notification.serviceId.c_str());
       removeQueuedNotification(i);
       i--;  // Adjust index since we removed an element
+    }
+  }
+}
+
+void processMeshCoreQueue() {
+  // Check if MeshCore is configured and if we have any pending MeshCore notifications
+  if (!isMeshCoreConfigured() || bleOperationInProgress) return;
+  
+  // Check if any notifications have pending MeshCore messages
+  bool hasPendingMesh = false;
+  for (int i = 0; i < queuedNotificationCount; i++) {
+    if (notificationQueue[i].meshPending) {
+      hasPendingMesh = true;
+      break;
+    }
+  }
+  if (!hasPendingMesh) return;
+  
+  // Check if enough time has passed since last MeshCore retry (10 minutes)
+  unsigned long currentTime = millis();
+  if (currentTime - lastMeshCoreRetry < MESHCORE_RETRY_INTERVAL) {
+    return;
+  }
+  
+  Serial.println("Processing MeshCore queue (batched BLE operation)...");
+  
+  // Pause monitoring to prevent false positives during network transition
+  monitoringPaused = true;
+  bleOperationInProgress = true;
+  lastMeshCoreRetry = currentTime;
+  
+  // Disconnect WiFi before starting BLE
+  disconnectWiFi();
+  
+  // Create the layered protocol stack on demand
+  BLECentralTransport::Config config;
+  config.deviceName = BLE_DEVICE_NAME;
+  config.peerName = BLE_PEER_NAME;
+  config.pairingPin = BLE_PAIRING_PIN;
+  
+  BLECentralTransport transport(config);
+  FrameCodec codec(transport);
+  CompanionProtocol protocol(transport, codec);
+  
+  bool sessionReady = false;
+  uint8_t channelIdx = 0;
+  
+  // Initialize, connect and prepare session once
+  if (transport.init()) {
+    if (transport.connect()) {
+      if (protocol.startSession("ESP32-Uptime")) {
+        if (protocol.findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+          sessionReady = true;
+          Serial.println("MeshCore session ready, sending queued messages...");
+        } else {
+          Serial.printf("MeshCore batch: channel not found - %s\n", protocol.getLastError().c_str());
+        }
+      } else {
+        Serial.printf("MeshCore batch: session start failed - %s\n", protocol.getLastError().c_str());
+      }
+    } else {
+      Serial.printf("MeshCore batch: not connected - %s\n", transport.getLastError().c_str());
+    }
+  } else {
+    Serial.printf("MeshCore batch: BLE init failed - %s\n", transport.getLastError().c_str());
+  }
+  
+  // Send all pending MeshCore notifications in this single session
+  if (sessionReady) {
+    for (int i = 0; i < queuedNotificationCount; i++) {
+      QueuedNotification& notification = notificationQueue[i];
+      if (notification.meshPending) {
+        String fullMessage = notification.title + ": " + notification.message;
+        if (protocol.sendTextMessageToChannel(channelIdx, fullMessage)) {
+          notification.meshPending = false;
+          Serial.printf("Retry: MeshCore notification sent for %s\n", notification.serviceId.c_str());
+        } else {
+          Serial.printf("MeshCore send failed for %s: %s\n", 
+                        notification.serviceId.c_str(), protocol.getLastError().c_str());
+        }
+        // Small delay between messages to avoid overwhelming the receiver
+        delay(100);
+      }
+    }
+  }
+  
+  // Disconnect BLE and deinitialize to free resources
+  transport.disconnect();
+  transport.deinit();
+  
+  // Reconnect WiFi
+  reconnectWiFi();
+  
+  // Resume monitoring
+  bleOperationInProgress = false;
+  monitoringPaused = false;
+  
+  Serial.println("MeshCore batch operation complete");
+  
+  // Clean up any notifications that have all channels sent
+  for (int i = 0; i < queuedNotificationCount; i++) {
+    QueuedNotification& notification = notificationQueue[i];
+    if (!notification.ntfyPending && !notification.discordPending && 
+        !notification.smtpPending && !notification.meshPending) {
+      Serial.printf("All notifications sent for %s, removing from queue\n", notification.serviceId.c_str());
+      removeQueuedNotification(i);
+      i--;
     }
   }
 }
