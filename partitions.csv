@@ -1,9 +1,11 @@
 # Partition table for ESP32-S3 with LittleFS support
-# The LittleFS partition is sized at 12MB (0xBF0000) to ensure reliable operation
-# while still fitting inside a 16MB flash layout that includes OTA partitions.
+# Note: The partition is named 'spiffs' because the Arduino ESP32 LittleFS library
+# looks for a partition with this name by default when calling LittleFS.begin().
+# Despite the name, LittleFS (not SPIFFS) is used as the filesystem.
+# Sized at ~12MB (0xBF0000) to fit within a 16MB flash layout with OTA partitions.
 # Name,      Type, SubType,  Offset,   Size,    Flags
 nvs,         data, nvs,      0x9000,   0x5000,
 otadata,     data, ota,      0xe000,   0x2000,
 app0,        app,  ota_0,    0x10000,  0x200000,
 app1,        app,  ota_1,    0x210000, 0x200000,
-littlefs,    data, spiffs, 0x410000, 0xBF0000,
+spiffs,      data, spiffs,   0x410000, 0xBF0000,
