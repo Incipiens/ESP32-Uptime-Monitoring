@@ -1337,7 +1337,7 @@ bool sendNtfyNotificationWithStatus(const String& title, const String& message, 
   int httpCode = http.POST(message);
   http.end();
 
-  if (httpCode > 0) {
+  if (httpCode >= 200 && httpCode < 300) {
     Serial.printf("ntfy notification sent: %d\n", httpCode);
     return true;
   } else {
@@ -1370,7 +1370,7 @@ bool sendDiscordNotificationWithStatus(const String& title, const String& messag
   int httpCode = http.POST(payload);
   http.end();
 
-  if (httpCode > 0) {
+  if (httpCode >= 200 && httpCode < 300) {
     Serial.printf("Discord notification sent: %d\n", httpCode);
     return true;
   } else {
@@ -1594,7 +1594,6 @@ void processNotificationQueue() {
     }
     
     notification.lastRetry = currentTime;
-    bool allSent = true;
     
     // Retry WiFi-based notifications only if WiFi is connected
     if (wifiConnected) {
@@ -1602,8 +1601,6 @@ void processNotificationQueue() {
         if (sendNtfyNotificationWithStatus(notification.title, notification.message, notification.tags)) {
           notification.ntfyPending = false;
           Serial.printf("Retry: ntfy notification sent for %s\n", notification.serviceId.c_str());
-        } else {
-          allSent = false;
         }
       }
       
@@ -1611,8 +1608,6 @@ void processNotificationQueue() {
         if (sendDiscordNotificationWithStatus(notification.title, notification.message)) {
           notification.discordPending = false;
           Serial.printf("Retry: Discord notification sent for %s\n", notification.serviceId.c_str());
-        } else {
-          allSent = false;
         }
       }
       
@@ -1620,14 +1615,7 @@ void processNotificationQueue() {
         if (sendSmtpNotificationWithStatus(notification.title, notification.message)) {
           notification.smtpPending = false;
           Serial.printf("Retry: SMTP notification sent for %s\n", notification.serviceId.c_str());
-        } else {
-          allSent = false;
         }
-      }
-    } else {
-      // WiFi not connected, keep pending if any WiFi notifications remain
-      if (notification.ntfyPending || notification.discordPending || notification.smtpPending) {
-        allSent = false;
       }
     }
     
@@ -1636,11 +1624,7 @@ void processNotificationQueue() {
       if (sendMeshCoreNotificationWithStatus(notification.title, notification.message)) {
         notification.meshPending = false;
         Serial.printf("Retry: MeshCore notification sent for %s\n", notification.serviceId.c_str());
-      } else {
-        allSent = false;
       }
-    } else if (notification.meshPending) {
-      allSent = false;
     }
     
     // Check if all pending notifications for this service have been sent
