@@ -1348,52 +1348,59 @@ void sendMeshCoreNotification(const String& title, const String& message) {
   // Disconnect WiFi before starting BLE
   disconnectWiFi();
   
-  // Create the layered protocol stack on demand
+  // Create the layered protocol stack on heap to reduce stack usage.
+  // Stack overflow can occur when these large objects are combined with
+  // deep BLE callback chains during sendTextMessageToChannel.
   BLECentralTransport::Config config;
   config.deviceName = BLE_DEVICE_NAME;
   config.peerName = BLE_PEER_NAME;
   config.pairingPin = BLE_PAIRING_PIN;
   
-  BLECentralTransport transport(config);
-  FrameCodec codec(transport);
-  CompanionProtocol protocol(transport, codec);
+  BLECentralTransport* transport = new BLECentralTransport(config);
+  FrameCodec* codec = new FrameCodec(*transport);
+  CompanionProtocol* protocol = new CompanionProtocol(*transport, *codec);
   
   bool success = false;
   
   // Initialize and connect
-  if (transport.init()) {
-    if (transport.connect()) {
+  if (transport->init()) {
+    if (transport->connect()) {
       // Start session
-      if (protocol.startSession("ESP32-Uptime")) {
+      if (protocol->startSession("ESP32-Uptime")) {
         // Find the configured channel
         uint8_t channelIdx;
-        if (protocol.findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+        if (protocol->findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
           // Build the message: combine title and message
           String fullMessage = title + ": " + message;
           
           // Send using the protocol layer
-          if (protocol.sendTextMessageToChannel(channelIdx, fullMessage)) {
+          if (protocol->sendTextMessageToChannel(channelIdx, fullMessage)) {
             Serial.println("MeshCore notification sent successfully");
             success = true;
           } else {
-            Serial.printf("MeshCore notification failed: send error - %s\n", protocol.getLastError().c_str());
+            Serial.printf("MeshCore notification failed: send error - %s\n", protocol->getLastError().c_str());
           }
         } else {
-          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol.getLastError().c_str());
+          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol->getLastError().c_str());
         }
       } else {
-        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol.getLastError().c_str());
+        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol->getLastError().c_str());
       }
     } else {
-      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport.getLastError().c_str());
+      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport->getLastError().c_str());
     }
   } else {
-    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport.getLastError().c_str());
+    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport->getLastError().c_str());
   }
   
   // Disconnect BLE and deinitialize to free resources
-  transport.disconnect();
-  transport.deinit();
+  transport->disconnect();
+  transport->deinit();
+  
+  // Clean up heap-allocated objects
+  delete protocol;
+  delete codec;
+  delete transport;
   
   // Reconnect WiFi
   reconnectWiFi();
@@ -1686,52 +1693,59 @@ bool sendMeshCoreNotificationWithStatus(const String& title, const String& messa
   // Disconnect WiFi before starting BLE
   disconnectWiFi();
   
-  // Create the layered protocol stack on demand
+  // Create the layered protocol stack on heap to reduce stack usage.
+  // Stack overflow can occur when these large objects are combined with
+  // deep BLE callback chains during sendTextMessageToChannel.
   BLECentralTransport::Config config;
   config.deviceName = BLE_DEVICE_NAME;
   config.peerName = BLE_PEER_NAME;
   config.pairingPin = BLE_PAIRING_PIN;
   
-  BLECentralTransport transport(config);
-  FrameCodec codec(transport);
-  CompanionProtocol protocol(transport, codec);
+  BLECentralTransport* transport = new BLECentralTransport(config);
+  FrameCodec* codec = new FrameCodec(*transport);
+  CompanionProtocol* protocol = new CompanionProtocol(*transport, *codec);
   
   bool success = false;
   
   // Initialize and connect
-  if (transport.init()) {
-    if (transport.connect()) {
+  if (transport->init()) {
+    if (transport->connect()) {
       // Start session
-      if (protocol.startSession("ESP32-Uptime")) {
+      if (protocol->startSession("ESP32-Uptime")) {
         // Find the configured channel
         uint8_t channelIdx;
-        if (protocol.findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+        if (protocol->findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
           // Build the message: combine title and message
           String fullMessage = title + ": " + message;
           
           // Send using the protocol layer
-          if (protocol.sendTextMessageToChannel(channelIdx, fullMessage)) {
+          if (protocol->sendTextMessageToChannel(channelIdx, fullMessage)) {
             Serial.println("MeshCore notification sent successfully");
             success = true;
           } else {
-            Serial.printf("MeshCore notification failed: send error - %s\n", protocol.getLastError().c_str());
+            Serial.printf("MeshCore notification failed: send error - %s\n", protocol->getLastError().c_str());
           }
         } else {
-          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol.getLastError().c_str());
+          Serial.printf("MeshCore notification skipped: channel not found - %s\n", protocol->getLastError().c_str());
         }
       } else {
-        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol.getLastError().c_str());
+        Serial.printf("MeshCore notification skipped: session start failed - %s\n", protocol->getLastError().c_str());
       }
     } else {
-      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport.getLastError().c_str());
+      Serial.printf("MeshCore notification skipped: not connected - %s\n", transport->getLastError().c_str());
     }
   } else {
-    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport.getLastError().c_str());
+    Serial.printf("MeshCore notification skipped: BLE init failed - %s\n", transport->getLastError().c_str());
   }
   
   // Disconnect BLE and deinitialize to free resources
-  transport.disconnect();
-  transport.deinit();
+  transport->disconnect();
+  transport->deinit();
+  
+  // Clean up heap-allocated objects
+  delete protocol;
+  delete codec;
+  delete transport;
   
   // Reconnect WiFi
   reconnectWiFi();
@@ -1898,37 +1912,39 @@ void processMeshCoreQueue() {
   // Disconnect WiFi before starting BLE
   disconnectWiFi();
   
-  // Create the layered protocol stack on demand
+  // Create the layered protocol stack on heap to reduce stack usage.
+  // Stack overflow can occur when these large objects are combined with
+  // deep BLE callback chains during sendTextMessageToChannel.
   BLECentralTransport::Config config;
   config.deviceName = BLE_DEVICE_NAME;
   config.peerName = BLE_PEER_NAME;
   config.pairingPin = BLE_PAIRING_PIN;
   
-  BLECentralTransport transport(config);
-  FrameCodec codec(transport);
-  CompanionProtocol protocol(transport, codec);
+  BLECentralTransport* transport = new BLECentralTransport(config);
+  FrameCodec* codec = new FrameCodec(*transport);
+  CompanionProtocol* protocol = new CompanionProtocol(*transport, *codec);
   
   bool sessionReady = false;
   uint8_t channelIdx = 0;
   
   // Initialize, connect and prepare session once
-  if (transport.init()) {
-    if (transport.connect()) {
-      if (protocol.startSession("ESP32-Uptime")) {
-        if (protocol.findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
+  if (transport->init()) {
+    if (transport->connect()) {
+      if (protocol->startSession("ESP32-Uptime")) {
+        if (protocol->findChannelByName(BLE_MESH_CHANNEL_NAME, channelIdx)) {
           sessionReady = true;
           Serial.println("MeshCore session ready, sending queued messages...");
         } else {
-          Serial.printf("MeshCore batch: channel not found - %s\n", protocol.getLastError().c_str());
+          Serial.printf("MeshCore batch: channel not found - %s\n", protocol->getLastError().c_str());
         }
       } else {
-        Serial.printf("MeshCore batch: session start failed - %s\n", protocol.getLastError().c_str());
+        Serial.printf("MeshCore batch: session start failed - %s\n", protocol->getLastError().c_str());
       }
     } else {
-      Serial.printf("MeshCore batch: not connected - %s\n", transport.getLastError().c_str());
+      Serial.printf("MeshCore batch: not connected - %s\n", transport->getLastError().c_str());
     }
   } else {
-    Serial.printf("MeshCore batch: BLE init failed - %s\n", transport.getLastError().c_str());
+    Serial.printf("MeshCore batch: BLE init failed - %s\n", transport->getLastError().c_str());
   }
   
   // Send all pending MeshCore notifications in this single session
@@ -1937,12 +1953,12 @@ void processMeshCoreQueue() {
       QueuedNotification& notification = notificationQueue[i];
       if (notification.meshPending) {
         String fullMessage = notification.title + ": " + notification.message;
-        if (protocol.sendTextMessageToChannel(channelIdx, fullMessage)) {
+        if (protocol->sendTextMessageToChannel(channelIdx, fullMessage)) {
           notification.meshPending = false;
           Serial.printf("Retry: MeshCore notification sent for %s\n", notification.serviceId.c_str());
         } else {
           Serial.printf("MeshCore send failed for %s: %s\n", 
-                        notification.serviceId.c_str(), protocol.getLastError().c_str());
+                        notification.serviceId.c_str(), protocol->getLastError().c_str());
         }
         // Small delay between messages to avoid overwhelming the receiver
         delay(100);
@@ -1951,8 +1967,13 @@ void processMeshCoreQueue() {
   }
   
   // Disconnect BLE and deinitialize to free resources
-  transport.disconnect();
-  transport.deinit();
+  transport->disconnect();
+  transport->deinit();
+  
+  // Clean up heap-allocated objects
+  delete protocol;
+  delete codec;
+  delete transport;
   
   // Reconnect WiFi
   reconnectWiFi();
