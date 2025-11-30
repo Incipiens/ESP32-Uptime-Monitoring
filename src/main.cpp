@@ -109,8 +109,10 @@ struct Service {
   int checkInterval;
   int passThreshold;      // Number of consecutive passes required to mark as UP
   int failThreshold;      // Number of consecutive fails required to mark as DOWN
+  int rearmCount;         // Number of failed checks before re-alerting (0 = disabled)
   int consecutivePasses;  // Current count of consecutive passes
   int consecutiveFails;   // Current count of consecutive fails
+  int failedChecksSinceAlert; // Failed checks since last alert (for re-arm)
   bool isUp;
   unsigned long lastCheck;
   unsigned long lastUptime;
@@ -516,8 +518,10 @@ void initWebServer() {
       obj["checkInterval"] = services[i].checkInterval;
       obj["passThreshold"] = services[i].passThreshold;
       obj["failThreshold"] = services[i].failThreshold;
+      obj["rearmCount"] = services[i].rearmCount;
       obj["consecutivePasses"] = services[i].consecutivePasses;
       obj["consecutiveFails"] = services[i].consecutiveFails;
+      obj["failedChecksSinceAlert"] = services[i].failedChecksSinceAlert;
       obj["isUp"] = services[i].isUp;
       obj["secondsSinceLastCheck"] = services[i].secondsSinceLastCheck;
       obj["lastError"] = services[i].lastError;
@@ -579,8 +583,13 @@ void initWebServer() {
       if (failThreshold < 1) failThreshold = 1;
       newService.failThreshold = failThreshold;
 
+      int rearmCount = doc["rearmCount"] | 0;
+      if (rearmCount < 0) rearmCount = 0;
+      newService.rearmCount = rearmCount;
+
       newService.consecutivePasses = 0;
       newService.consecutiveFails = 0;
+      newService.failedChecksSinceAlert = 0;
       newService.isUp = false;
       newService.lastCheck = 0;
       newService.lastUptime = 0;
@@ -647,6 +656,7 @@ void initWebServer() {
       obj["checkInterval"] = services[i].checkInterval;
       obj["passThreshold"] = services[i].passThreshold;
       obj["failThreshold"] = services[i].failThreshold;
+      obj["rearmCount"] = services[i].rearmCount;
     }
 
     String response;
@@ -728,6 +738,9 @@ void initWebServer() {
         int failThreshold = obj["failThreshold"] | 1;
         if (failThreshold < 1) failThreshold = 1;
 
+        int rearmCount = obj["rearmCount"] | 0;
+        if (rearmCount < 0) rearmCount = 0;
+
         Service newService;
         newService.id = generateServiceId();
         newService.name = name;
@@ -739,8 +752,10 @@ void initWebServer() {
         newService.checkInterval = checkInterval;
         newService.passThreshold = passThreshold;
         newService.failThreshold = failThreshold;
+        newService.rearmCount = rearmCount;
         newService.consecutivePasses = 0;
         newService.consecutiveFails = 0;
+        newService.failedChecksSinceAlert = 0;
         newService.isUp = false;
         newService.lastCheck = 0;
         newService.lastUptime = 0;
@@ -808,6 +823,7 @@ void checkServices() {
       services[i].consecutiveFails = 0;
       services[i].lastUptime = currentTime;
       services[i].lastError = "";
+      services[i].failedChecksSinceAlert = 0;  // Reset re-arm counter on success
     } else {
       services[i].consecutiveFails++;
       services[i].consecutivePasses = 0;
@@ -817,6 +833,7 @@ void checkServices() {
     if (!services[i].isUp && services[i].consecutivePasses >= services[i].passThreshold) {
       // Service has passed enough times to be considered UP
       services[i].isUp = true;
+      services[i].failedChecksSinceAlert = 0;  // Reset re-arm counter on recovery
     } else if (services[i].isUp && services[i].consecutiveFails >= services[i].failThreshold) {
       // Service has failed enough times to be considered DOWN
       services[i].isUp = false;
@@ -832,8 +849,18 @@ void checkServices() {
 
       if (!services[i].isUp) {
         sendOfflineNotification(services[i]);
+        services[i].failedChecksSinceAlert = 0;  // Reset counter after initial alert
       } else if (!firstCheck) {
         sendOnlineNotification(services[i]);
+      }
+    } else if (!services[i].isUp && !checkResult && services[i].rearmCount > 0) {
+      // Service is still DOWN and check failed - handle re-arm logic
+      services[i].failedChecksSinceAlert++;
+      if (services[i].failedChecksSinceAlert >= services[i].rearmCount) {
+        Serial.printf("Service '%s' still DOWN - re-arming alert after %d failed checks\n",
+          services[i].name.c_str(), services[i].failedChecksSinceAlert);
+        sendOfflineNotification(services[i]);
+        services[i].failedChecksSinceAlert = 0;  // Reset counter after re-arm alert
       }
     }
   }
@@ -1767,6 +1794,7 @@ void saveServices() {
     obj["checkInterval"] = services[i].checkInterval;
     obj["passThreshold"] = services[i].passThreshold;
     obj["failThreshold"] = services[i].failThreshold;
+    obj["rearmCount"] = services[i].rearmCount;
   }
 
   if (serializeJson(doc, file) == 0) {
@@ -1808,8 +1836,10 @@ void loadServices() {
     services[serviceCount].checkInterval = obj["checkInterval"];
     services[serviceCount].passThreshold = obj["passThreshold"] | 1;
     services[serviceCount].failThreshold = obj["failThreshold"] | 1;
+    services[serviceCount].rearmCount = obj["rearmCount"] | 0;
     services[serviceCount].consecutivePasses = 0;
     services[serviceCount].consecutiveFails = 0;
+    services[serviceCount].failedChecksSinceAlert = 0;
     services[serviceCount].isUp = false;
     services[serviceCount].lastCheck = 0;
     services[serviceCount].lastUptime = 0;
@@ -2186,6 +2216,11 @@ String getWebPage() {
                     </div>
                 </div>
 
+                <div class="form-group">
+                    <label for="rearmCount">Re-arm Alert Count (0 = disabled)</label>
+                    <input type="number" id="rearmCount" value="0" required min="0" title="Number of failed checks before re-alerting while service is DOWN. Set to 0 to disable.">
+                </div>
+
                 <div class="form-group" id="pathGroup">
                     <label for="servicePath">Path</label>
                     <input type="text" id="servicePath" value="/" placeholder="/">
@@ -2255,7 +2290,8 @@ String getWebPage() {
                 expectedResponse: document.getElementById('expectedResponse').value,
                 checkInterval: parseInt(document.getElementById('checkInterval').value),
                 passThreshold: parseInt(document.getElementById('passThreshold').value),
-                failThreshold: parseInt(document.getElementById('failThreshold').value)
+                failThreshold: parseInt(document.getElementById('failThreshold').value),
+                rearmCount: parseInt(document.getElementById('rearmCount').value)
             };
 
             try {
@@ -2321,6 +2357,10 @@ String getWebPage() {
                     }
                 }
 
+                const rearmInfo = service.rearmCount > 0 
+                    ? `${service.rearmCount} (${service.failedChecksSinceAlert || 0} since last alert)` 
+                    : 'disabled';
+
                 return `
                     <div class="service-card ${service.isUp ? 'up' : 'down'}">
                         <div class="service-header">
@@ -2345,6 +2385,9 @@ String getWebPage() {
                         </div>
                         <div class="service-info">
                             <strong>Thresholds:</strong> ${service.failThreshold} fail / ${service.passThreshold} pass
+                        </div>
+                        <div class="service-info">
+                            <strong>Re-arm Alert:</strong> ${rearmInfo}
                         </div>
                         <div class="service-info">
                             <strong>Consecutive:</strong> ${service.consecutivePasses} passes / ${service.consecutiveFails} fails
