@@ -142,6 +142,11 @@ const int MAX_SERVICES = 20;
 Service services[MAX_SERVICES];
 int serviceCount = 0;
 
+// Regex matching constants
+const int MAX_REGEX_PATTERN_LENGTH = 256;
+const char* REGEX_PREFIX = "regex:";
+const int REGEX_PREFIX_LENGTH = 6;
+
 // Notification queue for failed notifications
 // Only stores the latest notification per service (isUp state)
 // Tracks which notification channels have failed
@@ -905,7 +910,7 @@ void checkServices() {
 // Returns 0 on match, 1 on no match, -1 on pattern too long, -2 on invalid pattern
 int matchesRegex(const String& text, const String& pattern) {
   // Limit pattern length to prevent excessive resource usage
-  if (pattern.length() > 256) {
+  if (pattern.length() > MAX_REGEX_PATTERN_LENGTH) {
     return -1;
   }
   
@@ -943,8 +948,8 @@ bool checkHttpGet(Service& service) {
       } else {
         String payload = http.getString();
         // Check if expectedResponse is a regex pattern (prefixed with "regex:")
-        if (service.expectedResponse.startsWith("regex:")) {
-          String pattern = service.expectedResponse.substring(6);  // Remove "regex:" prefix
+        if (service.expectedResponse.startsWith(REGEX_PREFIX)) {
+          String pattern = service.expectedResponse.substring(REGEX_PREFIX_LENGTH);
           int regexResult = matchesRegex(payload, pattern);
           if (regexResult == 0) {
             isUp = true;
