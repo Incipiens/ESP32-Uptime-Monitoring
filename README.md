@@ -187,7 +187,7 @@ Optionally send a notification to all configured channels when the device boots 
 
 ### Connect Your ESP32 Board
 
-1. Connect your ESP32 board to your computer using a USB cable (this project is configured for ESP32-S3-DevKitC-1-N8R2, but other ESP32 boards may work with minor configuration changes)
+1. Connect your ESP32 board to your computer using a USB cable (this project is configured for ESP32-S3-DevKitC-1-N16R8, but other ESP32 boards may work with minor configuration changes)
 2. The board should be automatically detected by your system
 3. On Linux, you may need to add your user to the `dialout` group:
    ```bash
@@ -200,7 +200,7 @@ Optionally send a notification to all configured channels when the device boots 
 1. Open the project folder in VS Code
 2. Wait for PlatformIO to initialize (you'll see a progress indicator in the status bar)
 3. Click the PlatformIO icon in the left sidebar
-4. Under "Project Tasks" > "esp32-s3-devkitc-1-n8r2":
+4. Under "Project Tasks" > "esp32-n16r8":
    - Click **Build** to compile the firmware
    - Click **Upload** to flash the firmware to your ESP32
    - Click **Monitor** to view serial output
