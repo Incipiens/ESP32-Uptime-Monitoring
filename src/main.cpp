@@ -184,7 +184,7 @@ void sendSmtpNotification(const String& title, const String& message);
 bool checkHttpGet(Service& service);
 bool checkPing(Service& service);
 bool checkSnmpGet(Service& service);
-bool matchesRegex(const String& text, const String& pattern);
+int matchesRegex(const String& text, const String& pattern);
 String getWebPage();
 String getServiceTypeString(ServiceType type);
 String getSnmpCompareOpString(SnmpCompareOp op);
@@ -902,23 +902,28 @@ void checkServices() {
 }
 
 // Helper function to match text against a POSIX extended regex pattern
-bool matchesRegex(const String& text, const String& pattern) {
+// Returns 0 on match, 1 on no match, -1 on pattern too long, -2 on invalid pattern
+int matchesRegex(const String& text, const String& pattern) {
+  // Limit pattern length to prevent excessive resource usage
+  if (pattern.length() > 256) {
+    return -1;
+  }
+  
   regex_t regex;
   int result;
   
   // Compile the regex pattern with extended syntax
   result = regcomp(&regex, pattern.c_str(), REG_EXTENDED | REG_NOSUB);
   if (result != 0) {
-    // Pattern compilation failed
-    regfree(&regex);
-    return false;
+    // Pattern compilation failed - do not call regfree() on failed compile
+    return -2;
   }
   
   // Execute the regex match
   result = regexec(&regex, text.c_str(), 0, NULL, 0);
   regfree(&regex);
   
-  return result == 0;  // 0 means match found
+  return result == 0 ? 0 : 1;  // 0 = match, 1 = no match
 }
 
 bool checkHttpGet(Service& service) {
@@ -940,8 +945,14 @@ bool checkHttpGet(Service& service) {
         // Check if expectedResponse is a regex pattern (prefixed with "regex:")
         if (service.expectedResponse.startsWith("regex:")) {
           String pattern = service.expectedResponse.substring(6);  // Remove "regex:" prefix
-          isUp = matchesRegex(payload, pattern);
-          if (!isUp) {
+          int regexResult = matchesRegex(payload, pattern);
+          if (regexResult == 0) {
+            isUp = true;
+          } else if (regexResult == -1) {
+            service.lastError = "Regex pattern too long";
+          } else if (regexResult == -2) {
+            service.lastError = "Invalid regex pattern";
+          } else {
             service.lastError = "Regex mismatch";
           }
         } else {
