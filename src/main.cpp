@@ -393,7 +393,7 @@ void initFileSystem() {
   // This can happen if the partition table is misconfigured
   if (!LittleFS.format()) {
     Serial.println("LittleFS format failed! Check partition table and flash configuration.");
-    Serial.println("Ensure partition with type 'spiffs' (used by LittleFS) exists in partitions.csv.");
+    Serial.println("Ensure a 'littlefs' data partition exists in partitions.csv and matches your flash size.");
     return;
   }
 
