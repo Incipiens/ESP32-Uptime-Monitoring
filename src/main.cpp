@@ -8,6 +8,8 @@
 #include <HTTPClient.h>
 #include <ESP32Ping.h>
 #include <mbedtls/base64.h>
+#include <WiFiUdp.h>
+#include <Arduino_SNMP_Manager.h>
 
 // MeshCore layered protocol implementation
 #include "MeshCore.hpp"
@@ -92,7 +94,18 @@ int getMeshProtocolState() {
 // However, you can use this to expand and add services with more complex checks
 enum ServiceType {
   TYPE_HTTP_GET,
-  TYPE_PING
+  TYPE_PING,
+  TYPE_SNMP_GET
+};
+
+// SNMP comparison operators for value checks
+enum SnmpCompareOp {
+  SNMP_OP_EQ,    // Equal (=)
+  SNMP_OP_NE,    // Not equal (<>)
+  SNMP_OP_LT,    // Less than (<)
+  SNMP_OP_LE,    // Less than or equal (<=)
+  SNMP_OP_GT,    // Greater than (>)
+  SNMP_OP_GE     // Greater than or equal (>=)
 };
 
 // Service structure
@@ -116,6 +129,11 @@ struct Service {
   unsigned long lastUptime;
   String lastError;
   int secondsSinceLastCheck;
+  // SNMP-specific fields
+  String snmpOid;         // SNMP OID to query (e.g., "1.3.6.1.2.1.1.1.0")
+  String snmpCommunity;   // SNMP community string (default: "public")
+  SnmpCompareOp snmpCompareOp;  // Comparison operator for SNMP value check
+  String snmpExpectedValue;     // Expected value for comparison
 };
 
 // Store up to 20 services
@@ -164,8 +182,11 @@ void sendOnlineNotification(const Service& service);
 void sendSmtpNotification(const String& title, const String& message);
 bool checkHttpGet(Service& service);
 bool checkPing(Service& service);
+bool checkSnmpGet(Service& service);
 String getWebPage();
 String getServiceTypeString(ServiceType type);
+String getSnmpCompareOpString(SnmpCompareOp op);
+SnmpCompareOp parseSnmpCompareOp(const String& opStr);
 String base64Encode(const String& input);
 bool readSmtpResponse(WiFiClient& client, int expectedCode);
 bool sendSmtpCommand(WiFiClient& client, const String& command, int expectedCode);
@@ -521,6 +542,11 @@ void initWebServer() {
       obj["isUp"] = services[i].isUp;
       obj["secondsSinceLastCheck"] = services[i].secondsSinceLastCheck;
       obj["lastError"] = services[i].lastError;
+      // SNMP-specific fields
+      obj["snmpOid"] = services[i].snmpOid;
+      obj["snmpCommunity"] = services[i].snmpCommunity;
+      obj["snmpCompareOp"] = getSnmpCompareOpString(services[i].snmpCompareOp);
+      obj["snmpExpectedValue"] = services[i].snmpExpectedValue;
     }
 
     String response;
@@ -556,6 +582,8 @@ void initWebServer() {
         newService.type = TYPE_HTTP_GET;
       } else if (typeStr == "ping") {
         newService.type = TYPE_PING;
+      } else if (typeStr == "snmp_get") {
+        newService.type = TYPE_SNMP_GET;
       } else {
         request->send(400, "application/json", "{\"error\":\"Invalid service type\"}");
         return;
@@ -578,6 +606,13 @@ void initWebServer() {
       int rearmCount = doc["rearmCount"] | 0;
       if (rearmCount < 0) rearmCount = 0;
       newService.rearmCount = rearmCount;
+
+      // SNMP-specific fields
+      newService.snmpOid = doc["snmpOid"] | "";
+      newService.snmpCommunity = doc["snmpCommunity"] | "public";
+      String compareOpStr = doc["snmpCompareOp"] | "=";
+      newService.snmpCompareOp = parseSnmpCompareOp(compareOpStr);
+      newService.snmpExpectedValue = doc["snmpExpectedValue"] | "";
 
       newService.consecutivePasses = 0;
       newService.consecutiveFails = 0;
@@ -649,6 +684,11 @@ void initWebServer() {
       obj["passThreshold"] = services[i].passThreshold;
       obj["failThreshold"] = services[i].failThreshold;
       obj["rearmCount"] = services[i].rearmCount;
+      // SNMP-specific fields
+      obj["snmpOid"] = services[i].snmpOid;
+      obj["snmpCommunity"] = services[i].snmpCommunity;
+      obj["snmpCompareOp"] = getSnmpCompareOpString(services[i].snmpCompareOp);
+      obj["snmpExpectedValue"] = services[i].snmpExpectedValue;
     }
 
     String response;
@@ -708,6 +748,8 @@ void initWebServer() {
           type = TYPE_HTTP_GET;
         } else if (typeStr == "ping") {
           type = TYPE_PING;
+        } else if (typeStr == "snmp_get") {
+          type = TYPE_SNMP_GET;
         } else {
           skippedCount++;
           continue;
@@ -741,6 +783,12 @@ void initWebServer() {
         newService.passThreshold = passThreshold;
         newService.failThreshold = failThreshold;
         newService.rearmCount = rearmCount;
+        // SNMP-specific fields
+        newService.snmpOid = obj["snmpOid"] | "";
+        newService.snmpCommunity = obj["snmpCommunity"] | "public";
+        String compareOpStr = obj["snmpCompareOp"] | "=";
+        newService.snmpCompareOp = parseSnmpCompareOp(compareOpStr);
+        newService.snmpExpectedValue = obj["snmpExpectedValue"] | "";
         newService.consecutivePasses = 0;
         newService.consecutiveFails = 0;
         newService.failedChecksSinceAlert = 0;
@@ -796,6 +844,9 @@ void checkServices() {
         break;
       case TYPE_PING:
         checkResult = checkPing(services[i]);
+        break;
+      case TYPE_SNMP_GET:
+        checkResult = checkSnmpGet(services[i]);
         break;
     }
 
@@ -886,6 +937,173 @@ bool checkPing(Service& service) {
     service.lastError = "Ping timeout";
   }
   return success;
+}
+
+// Helper function to compare SNMP values based on operator
+bool compareSnmpValue(const String& actualValue, SnmpCompareOp op, const String& expectedValue) {
+  // Try numeric comparison first
+  bool actualIsNumeric = true;
+  bool expectedIsNumeric = true;
+  float actualNum = 0;
+  float expectedNum = 0;
+  
+  // Check if actual value is numeric
+  if (actualValue.length() > 0) {
+    char* endPtr;
+    actualNum = strtof(actualValue.c_str(), &endPtr);
+    if (*endPtr != '\0') {
+      actualIsNumeric = false;
+    }
+  } else {
+    actualIsNumeric = false;
+  }
+  
+  // Check if expected value is numeric
+  if (expectedValue.length() > 0) {
+    char* endPtr;
+    expectedNum = strtof(expectedValue.c_str(), &endPtr);
+    if (*endPtr != '\0') {
+      expectedIsNumeric = false;
+    }
+  } else {
+    expectedIsNumeric = false;
+  }
+  
+  // Use numeric comparison if both are numeric
+  if (actualIsNumeric && expectedIsNumeric) {
+    switch (op) {
+      case SNMP_OP_EQ: return actualNum == expectedNum;
+      case SNMP_OP_NE: return actualNum != expectedNum;
+      case SNMP_OP_LT: return actualNum < expectedNum;
+      case SNMP_OP_LE: return actualNum <= expectedNum;
+      case SNMP_OP_GT: return actualNum > expectedNum;
+      case SNMP_OP_GE: return actualNum >= expectedNum;
+    }
+  }
+  
+  // Fall back to string comparison for non-numeric values
+  int cmp = actualValue.compareTo(expectedValue);
+  switch (op) {
+    case SNMP_OP_EQ: return cmp == 0;
+    case SNMP_OP_NE: return cmp != 0;
+    case SNMP_OP_LT: return cmp < 0;
+    case SNMP_OP_LE: return cmp <= 0;
+    case SNMP_OP_GT: return cmp > 0;
+    case SNMP_OP_GE: return cmp >= 0;
+  }
+  
+  return false;
+}
+
+bool checkSnmpGet(Service& service) {
+  // Resolve hostname to IP
+  IPAddress targetIP;
+  if (!WiFi.hostByName(service.host.c_str(), targetIP)) {
+    service.lastError = "DNS resolution failed";
+    return false;
+  }
+  
+  // Create SNMP objects for this request
+  WiFiUDP udp;
+  SNMPManager snmpManager(service.snmpCommunity.c_str());
+  SNMPGet snmpRequest(service.snmpCommunity.c_str(), 1);  // SNMP version 2c (0=v1, 1=v2c)
+  
+  // Initialize SNMP manager
+  snmpManager.setUDP(&udp);
+  snmpManager.begin();
+  
+  // Use local variables to avoid thread safety issues
+  // Use special marker values to detect if they were updated
+  char stringValue[256];
+  char* stringValuePtr = stringValue;
+  stringValue[0] = '\0';
+  
+  // Use special marker value that's unlikely to be a real SNMP response
+  // INT32_MIN is used as a sentinel to detect if the value was updated
+  int intValue = INT32_MIN;
+  
+  String responseValue = "";
+  bool gotResponse = false;
+  
+  // Add handler for string values (covers most SNMP types including OctetString)
+  ValueCallback* stringCallback = snmpManager.addStringHandler(targetIP, service.snmpOid.c_str(), &stringValuePtr);
+  
+  // Also add integer handler for numeric values
+  ValueCallback* intCallback = snmpManager.addIntegerHandler(targetIP, service.snmpOid.c_str(), &intValue);
+  
+  // Build and send SNMP request
+  snmpRequest.addOIDPointer(stringCallback);
+  snmpRequest.setIP(WiFi.localIP());
+  snmpRequest.setUDP(&udp);
+  snmpRequest.setRequestID(random(1, 65535));
+  
+  if (!snmpRequest.sendTo(targetIP)) {
+    service.lastError = "Failed to send SNMP request";
+    return false;
+  }
+  snmpRequest.clearOIDList();
+  
+  // Wait for response with timeout (5 seconds)
+  unsigned long startTime = millis();
+  const unsigned long timeout = 5000;
+  
+  while (millis() - startTime < timeout) {
+    snmpManager.loop();
+    
+    // Check if we got a string response (non-empty string)
+    if (stringValue[0] != '\0') {
+      responseValue = String(stringValue);
+      gotResponse = true;
+      break;
+    }
+    
+    // Check if we got an integer response (value changed from sentinel)
+    if (intValue != INT32_MIN) {
+      responseValue = String(intValue);
+      gotResponse = true;
+      break;
+    }
+    
+    delay(10);
+  }
+  
+  if (!gotResponse) {
+    service.lastError = "SNMP timeout";
+    return false;
+  }
+  
+  // Compare the received value with expected value
+  bool success = compareSnmpValue(responseValue, service.snmpCompareOp, service.snmpExpectedValue);
+  
+  if (!success) {
+    service.lastError = "Value mismatch: got '" + responseValue + "', expected " + 
+                        getSnmpCompareOpString(service.snmpCompareOp) + " '" + 
+                        service.snmpExpectedValue + "'";
+  }
+  
+  return success;
+}
+
+String getSnmpCompareOpString(SnmpCompareOp op) {
+  switch (op) {
+    case SNMP_OP_EQ: return "=";
+    case SNMP_OP_NE: return "<>";
+    case SNMP_OP_LT: return "<";
+    case SNMP_OP_LE: return "<=";
+    case SNMP_OP_GT: return ">";
+    case SNMP_OP_GE: return ">=";
+    default: return "=";
+  }
+}
+
+SnmpCompareOp parseSnmpCompareOp(const String& opStr) {
+  if (opStr == "=" || opStr == "eq") return SNMP_OP_EQ;
+  if (opStr == "<>" || opStr == "ne") return SNMP_OP_NE;
+  if (opStr == "<" || opStr == "lt") return SNMP_OP_LT;
+  if (opStr == "<=" || opStr == "le") return SNMP_OP_LE;
+  if (opStr == ">" || opStr == "gt") return SNMP_OP_GT;
+  if (opStr == ">=" || opStr == "ge") return SNMP_OP_GE;
+  return SNMP_OP_EQ;  // Default to equal
 }
 
 void sendOfflineNotification(const Service& service) {
@@ -1732,6 +1950,11 @@ void saveServices() {
     obj["passThreshold"] = services[i].passThreshold;
     obj["failThreshold"] = services[i].failThreshold;
     obj["rearmCount"] = services[i].rearmCount;
+    // SNMP-specific fields
+    obj["snmpOid"] = services[i].snmpOid;
+    obj["snmpCommunity"] = services[i].snmpCommunity;
+    obj["snmpCompareOp"] = (int)services[i].snmpCompareOp;
+    obj["snmpExpectedValue"] = services[i].snmpExpectedValue;
   }
 
   if (serializeJson(doc, file) == 0) {
@@ -1774,6 +1997,11 @@ void loadServices() {
     services[serviceCount].passThreshold = obj["passThreshold"] | 1;
     services[serviceCount].failThreshold = obj["failThreshold"] | 1;
     services[serviceCount].rearmCount = obj["rearmCount"] | 0;
+    // SNMP-specific fields
+    services[serviceCount].snmpOid = obj["snmpOid"] | "";
+    services[serviceCount].snmpCommunity = obj["snmpCommunity"] | "public";
+    services[serviceCount].snmpCompareOp = (SnmpCompareOp)(obj["snmpCompareOp"].as<int>());
+    services[serviceCount].snmpExpectedValue = obj["snmpExpectedValue"] | "";
     services[serviceCount].consecutivePasses = 0;
     services[serviceCount].consecutiveFails = 0;
     services[serviceCount].failedChecksSinceAlert = 0;
@@ -1793,6 +2021,7 @@ String getServiceTypeString(ServiceType type) {
   switch (type) {
     case TYPE_HTTP_GET: return "http_get";
     case TYPE_PING: return "ping";
+    case TYPE_SNMP_GET: return "snmp_get";
     default: return "unknown";
   }
 }
@@ -2116,6 +2345,7 @@ String getWebPage() {
                         <select id="serviceType" required>
                             <option value="http_get">HTTP GET</option>
                             <option value="ping">Ping</option>
+                            <option value="snmp_get">SNMP GET</option>
                         </select>
                     </div>
 
@@ -2164,6 +2394,35 @@ String getWebPage() {
                     <input type="text" id="expectedResponse" value="*" placeholder="*">
                 </div>
 
+                <div class="form-group hidden" id="snmpOidGroup">
+                    <label for="snmpOid">SNMP OID</label>
+                    <input type="text" id="snmpOid" value="" placeholder="1.3.6.1.2.1.1.1.0">
+                </div>
+
+                <div class="form-group hidden" id="snmpCommunityGroup">
+                    <label for="snmpCommunity">SNMP Community String</label>
+                    <input type="text" id="snmpCommunity" value="public" placeholder="public">
+                </div>
+
+                <div class="form-row hidden" id="snmpCompareGroup">
+                    <div class="form-group">
+                        <label for="snmpCompareOp">Comparison Operator</label>
+                        <select id="snmpCompareOp">
+                            <option value="=">=  (Equal)</option>
+                            <option value="<>"><>  (Not Equal)</option>
+                            <option value="<"><  (Less Than)</option>
+                            <option value="<="><= (Less or Equal)</option>
+                            <option value=">">  (Greater Than)</option>
+                            <option value=">=">>= (Greater or Equal)</option>
+                        </select>
+                    </div>
+
+                    <div class="form-group">
+                        <label for="snmpExpectedValue">Expected Value</label>
+                        <input type="text" id="snmpExpectedValue" value="" placeholder="Expected value">
+                    </div>
+                </div>
+
                 <button type="submit" class="btn btn-primary">Add Service</button>
             </form>
         </div>
@@ -2185,12 +2444,28 @@ String getWebPage() {
             const pathGroup = document.getElementById('pathGroup');
             const responseGroup = document.getElementById('responseGroup');
             const portInput = document.getElementById('servicePort');
+            const snmpOidGroup = document.getElementById('snmpOidGroup');
+            const snmpCommunityGroup = document.getElementById('snmpCommunityGroup');
+            const snmpCompareGroup = document.getElementById('snmpCompareGroup');
 
             if (type === 'ping') {
                 pathGroup.classList.add('hidden');
                 responseGroup.classList.add('hidden');
+                snmpOidGroup.classList.add('hidden');
+                snmpCommunityGroup.classList.add('hidden');
+                snmpCompareGroup.classList.add('hidden');
+            } else if (type === 'snmp_get') {
+                pathGroup.classList.add('hidden');
+                responseGroup.classList.add('hidden');
+                snmpOidGroup.classList.remove('hidden');
+                snmpCommunityGroup.classList.remove('hidden');
+                snmpCompareGroup.classList.remove('hidden');
+                portInput.value = 161;
             } else {
                 pathGroup.classList.remove('hidden');
+                snmpOidGroup.classList.add('hidden');
+                snmpCommunityGroup.classList.add('hidden');
+                snmpCompareGroup.classList.add('hidden');
 
                 if (type === 'http_get') {
                     responseGroup.classList.remove('hidden');
@@ -2217,7 +2492,11 @@ String getWebPage() {
                 checkInterval: parseInt(document.getElementById('checkInterval').value),
                 passThreshold: parseInt(document.getElementById('passThreshold').value),
                 failThreshold: parseInt(document.getElementById('failThreshold').value),
-                rearmCount: parseInt(document.getElementById('rearmCount').value)
+                rearmCount: parseInt(document.getElementById('rearmCount').value),
+                snmpOid: document.getElementById('snmpOid').value,
+                snmpCommunity: document.getElementById('snmpCommunity').value,
+                snmpCompareOp: document.getElementById('snmpCompareOp').value,
+                snmpExpectedValue: document.getElementById('snmpExpectedValue').value
             };
 
             try {
@@ -2287,6 +2566,22 @@ String getWebPage() {
                     ? `${service.rearmCount} (${service.failedChecksSinceAlert} since last alert)` 
                     : 'disabled';
 
+                // Build SNMP info section if applicable
+                let snmpInfo = '';
+                if (service.type === 'snmp_get' && service.snmpOid) {
+                    snmpInfo = `
+                        <div class="service-info">
+                            <strong>OID:</strong> ${service.snmpOid}
+                        </div>
+                        <div class="service-info">
+                            <strong>Community:</strong> ${service.snmpCommunity}
+                        </div>
+                        <div class="service-info">
+                            <strong>Check:</strong> value ${service.snmpCompareOp} ${service.snmpExpectedValue}
+                        </div>
+                    `;
+                }
+
                 return `
                     <div class="service-card ${service.isUp ? 'up' : 'down'}">
                         <div class="service-header">
@@ -2301,11 +2596,12 @@ String getWebPage() {
                         <div class="service-info">
                             <strong>Host:</strong> ${service.host}:${service.port}
                         </div>
-                        ${service.path && service.type !== 'ping' ? `
+                        ${service.path && service.type !== 'ping' && service.type !== 'snmp_get' ? `
                         <div class="service-info">
                             <strong>Path:</strong> ${service.path}
                         </div>
                         ` : ''}
+                        ${snmpInfo}
                         <div class="service-info">
                             <strong>Check Interval:</strong> ${service.checkInterval}s
                         </div>
